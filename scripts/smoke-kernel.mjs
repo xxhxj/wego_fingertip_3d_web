@@ -95,6 +95,228 @@ const tiny = buildExtrusion(kernel, {
 });
 assert(tiny.error === "拉伸距离太小", "零距离应被拒绝");
 
+const { replayModel } = await server.ssrLoadModule("/src/kernel/replay.ts");
+const planes = [
+  { id: "plane-xy", name: "XY", kind: "principal", origin: { x: 0, y: 0, z: 0 }, normal: { x: 0, y: 0, z: 1 }, xDir: { x: 1, y: 0, z: 0 } },
+  { id: "plane-yz", name: "YZ", kind: "principal", origin: { x: 0, y: 0, z: 0 }, normal: { x: 1, y: 0, z: 0 }, xDir: { x: 0, y: 1, z: 0 } },
+];
+
+function solidBody(id, featureId) {
+  return { id, name: id, color: "#2f6fed", visible: true, featureId };
+}
+
+function play(features, bodies, sketches) {
+  return replayModel(kernel, {
+    planes,
+    sketches: sketches ?? [{
+      id: "sk",
+      name: "草图",
+      planeId: "plane-xy",
+      entities: [
+        { id: "a", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 20, y: 20 } },
+        { id: "b", type: "rectangle", a: { x: 10, y: 0 }, b: { x: 30, y: 20 } },
+        { id: "ring", type: "rectangle", a: { x: 0, y: 10 }, b: { x: 20, y: 30 } },
+        { id: "wide", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 40, y: 25 } },
+        { id: "offset", type: "rectangle", a: { x: 30, y: 0 }, b: { x: 50, y: 20 } },
+      ],
+    }],
+    features,
+    bodies,
+    preview: null,
+  });
+}
+
+function meshOf(results, id) {
+  const found = results.find((item) => item.id === id);
+  if (!found) throw new Error(`${id} 没有结果`);
+  if (found.error) throw new Error(`${id}: ${found.error}`);
+  return found;
+}
+
+function failed(results, id) {
+  return results.find((item) => item.id === id && item.error)?.error;
+}
+
+const boxFeature = (id, entityId, bodyId, extra = {}) => ({
+  id,
+  type: "extrude",
+  name: id,
+  sketchId: "sk",
+  entityId,
+  start: 0,
+  end: 20,
+  bodyId,
+  wall: 0,
+  sheet: false,
+  draftAngle: 0,
+  ...extra,
+});
+
+const fused = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    boxFeature("eb", "b", "bb"),
+    { id: "fuse", type: "boolean", name: "并集", operation: "fuse", targetBodyId: "ba", toolBodyId: "bb" },
+  ],
+  [solidBody("ba", "ea"), solidBody("bb", "eb")],
+);
+near(meshOf(fused, "ba").volume, 12000, "并集体积");
+assert(!failed(fused, "fuse"), `并集报错 ${failed(fused, "fuse")}`);
+
+const cut = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    boxFeature("eb", "b", "bb"),
+    { id: "cut", type: "boolean", name: "差集", operation: "cut", targetBodyId: "ba", toolBodyId: "bb" },
+  ],
+  [solidBody("ba", "ea"), solidBody("bb", "eb")],
+);
+near(meshOf(cut, "ba").volume, 4000, "差集体积");
+
+const common = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    boxFeature("eb", "b", "bb"),
+    { id: "common", type: "boolean", name: "交集", operation: "common", targetBodyId: "ba", toolBodyId: "bb" },
+  ],
+  [solidBody("ba", "ea"), solidBody("bb", "eb")],
+);
+near(meshOf(common, "ba").volume, 4000, "交集体积");
+
+const spun = play(
+  [{
+    id: "rev",
+    type: "revolve",
+    name: "旋转",
+    sketchId: "sk",
+    entityId: "ring",
+    axis: "u",
+    angleDeg: 360,
+    operation: "new",
+    targetBodyId: null,
+    bodyId: "br",
+  }],
+  [solidBody("br", "rev")],
+);
+near(meshOf(spun, "br").volume, 400 * 2 * Math.PI * 20, "旋转体积");
+
+const rounded = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    { id: "fillet", type: "fillet", name: "圆角", bodyId: "ba", radius: 2 },
+  ],
+  [solidBody("ba", "ea")],
+);
+assert(!failed(rounded, "fillet"), `圆角报错 ${failed(rounded, "fillet")}`);
+const filletVolume = meshOf(rounded, "ba").volume;
+assert(filletVolume < 7900 && filletVolume > 4000, `圆角体积 ${filletVolume}`);
+
+const chamfered = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    { id: "chamfer", type: "chamfer", name: "倒角", bodyId: "ba", distance: 2 },
+  ],
+  [solidBody("ba", "ea")],
+);
+assert(!failed(chamfered, "chamfer"), `倒角报错 ${failed(chamfered, "chamfer")}`);
+const chamferVolume = meshOf(chamfered, "ba").volume;
+assert(chamferVolume < 7900 && chamferVolume > 4000, `倒角体积 ${chamferVolume}`);
+
+const shelled = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    { id: "shell", type: "shell", name: "抽壳", bodyId: "ba", thickness: 2, direction: { x: 0, y: 0, z: 1 } },
+  ],
+  [solidBody("ba", "ea")],
+);
+assert(!failed(shelled, "shell"), `抽壳报错 ${failed(shelled, "shell")}`);
+near(meshOf(shelled, "ba").volume, 8000 - 16 * 16 * 18, "抽壳体积");
+
+const moved = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    { id: "move", type: "move", name: "移动", bodyId: "ba", dx: 100, dy: 0, dz: 0, copy: false, newBodyId: null },
+  ],
+  [solidBody("ba", "ea")],
+);
+near(meshOf(moved, "ba").volume, 8000, "移动后体积");
+const movedMax = maxAxis(meshOf(moved, "ba").positions, 0);
+assert(movedMax > 110 && movedMax < 130, `移动后 X ${movedMax}`);
+
+const copied = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    { id: "copy", type: "move", name: "复制", bodyId: "ba", dx: 40, dy: 0, dz: 0, copy: true, newBodyId: "bc" },
+  ],
+  [solidBody("ba", "ea"), solidBody("bc", "copy")],
+);
+near(meshOf(copied, "ba").volume, 8000, "复制后源体积");
+near(meshOf(copied, "bc").volume, 8000, "复制体体积");
+
+const mirrored = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    { id: "mirror", type: "mirror", name: "镜像", bodyId: "ba", planeId: "plane-yz", newBodyId: "bm" },
+  ],
+  [solidBody("ba", "ea"), solidBody("bm", "mirror")],
+);
+near(meshOf(mirrored, "bm").volume, 8000, "镜像体积");
+const mirrorMin = minAxis(meshOf(mirrored, "bm").positions, 0);
+assert(mirrorMin < -10, `镜像应到 X 负侧 ${mirrorMin}`);
+
+const linear = play(
+  [
+    boxFeature("ea", "offset", "ba"),
+    { id: "linear", type: "linearPattern", name: "线性", bodyId: "ba", direction: { x: 1, y: 0, z: 0 }, spacing: 40, count: 3 },
+  ],
+  [solidBody("ba", "ea")],
+);
+const linearVolume = meshOf(linear, "ba").volume;
+near(linearVolume, 24000, "线性阵列含种子，共 3 个");
+
+const circular = play(
+  [
+    boxFeature("ea", "offset", "ba"),
+    { id: "circular", type: "circularPattern", name: "圆周", bodyId: "ba", center: { x: 0, y: 0, z: 0 }, axis: { x: 0, y: 0, z: 1 }, angleDeg: 90, count: 4 },
+  ],
+  [solidBody("ba", "ea")],
+);
+const circularVolume = meshOf(circular, "ba").volume;
+near(circularVolume, 32000, "圆周阵列含种子，间隔 90°");
+
+const walled = play(
+  [boxFeature("ew", "wide", "bw", { wall: 2 })],
+  [solidBody("bw", "ew")],
+);
+const wallVolume = meshOf(walled, "bw").volume;
+near(wallVolume, (40 * 25 - 36 * 21) * 20, "薄壁体积");
+
+const sheet = play(
+  [boxFeature("es", "a", "bs", { sheet: true })],
+  [solidBody("bs", "es")],
+);
+assert(meshOf(sheet, "bs").positions.length > 0, "片体没有网格");
+assert(meshOf(sheet, "bs").volume === 0, "片体不应有实体体积");
+
+const drafted = play(
+  [boxFeature("ed", "a", "bd", { draftAngle: 8 })],
+  [solidBody("bd", "ed")],
+);
+assert(!failed(drafted, "ed"), `拔模报错 ${failed(drafted, "ed")}`);
+near(meshOf(drafted, "bd").volume, 5962, "拔模体积");
+
+function maxAxis(positions, offset) {
+  let value = -Infinity;
+  for (let index = offset; index < positions.length; index += 3) value = Math.max(value, positions[index]);
+  return value;
+}
+
+function minAxis(positions, offset) {
+  let value = Infinity;
+  for (let index = offset; index < positions.length; index += 3) value = Math.min(value, positions[index]);
+  return value;
+}
+
 kernel[Symbol.dispose]();
 await server.close();
 console.log("kernel smoke ok");

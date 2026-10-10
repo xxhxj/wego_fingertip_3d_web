@@ -1,5 +1,5 @@
-import type { OcctKernel, ShapeHandle } from "occt-wasm";
-import { normalize, scale, toWorld } from "../model/math";
+import { JoinType, type OcctKernel, type ShapeHandle } from "occt-wasm";
+import { normalize, scale, toWorld, yAxis } from "../model/math";
 import { isClosed, rectangleCorners } from "../model/profiles";
 import type { PlaneFrame, SketchEntity, Vec3 } from "../model/types";
 
@@ -39,38 +39,16 @@ export function buildExtrusion(kernel: OcctKernel, job: BuildJob): BuildResult {
   }
   if (!isClosed(job.entity)) return { id: job.id, error: "截面未封闭" };
 
-  const plane: PlaneFrame = {
-    ...job.plane,
-    normal: normalize(job.plane.normal),
-    xDir: normalize(job.plane.xDir),
-  };
   const created: ShapeHandle[] = [];
   try {
-    const face = makeProfileFace(kernel, plane, job.entity, created);
-    const moved = kernel.translate(face, plane.normal.x * job.start, plane.normal.y * job.start, plane.normal.z * job.start);
-    created.push(moved);
-    const direction = scale(plane.normal, height);
-    const solid = kernel.extrude(moved, direction.x, direction.y, direction.z);
-    created.push(solid);
-    const deflection = job.quality === "preview"
-      ? { linearDeflection: 0.4, angularDeflection: 0.6 }
-      : { linearDeflection: 0.08, angularDeflection: 0.35 };
-    const mesh = kernel.meshShape(solid, deflection);
-    let edges: Float32Array<ArrayBuffer> = new Float32Array();
-    try {
-      const wire = kernel.wireframe(solid, { source: "triangulation", deflection: deflection.linearDeflection });
-      edges = edgeSegments(wire.points, wire.edgeGroups, wire.edgeCount);
-    } catch {
-      edges = new Float32Array();
-    }
-    return {
-      id: job.id,
-      positions: copyFloat32(mesh.positions),
-      normals: copyFloat32(mesh.normals),
-      indices: copyUint32(mesh.indices),
-      edges,
-      volume: kernel.getVolume(solid),
-    };
+    const solid = makeExtrudedShape(kernel, job.plane, job.entity, {
+      start: job.start,
+      end: job.end,
+      wall: 0,
+      sheet: false,
+      draftAngle: 0,
+    }, created);
+    return tessellateShape(kernel, job.id, solid, job.quality);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { id: job.id, error: message || "拉伸失败" };
@@ -83,6 +61,176 @@ export function buildExtrusion(kernel: OcctKernel, job: BuildJob): BuildResult {
       }
     }
   }
+}
+
+export interface ExtrudeOptions {
+  start: number;
+  end: number;
+  wall: number;
+  sheet: boolean;
+  draftAngle: number;
+}
+
+export function makeExtrudedShape(
+  kernel: OcctKernel,
+  plane: PlaneFrame,
+  entity: SketchEntity,
+  options: ExtrudeOptions,
+  created: ShapeHandle[],
+): ShapeHandle {
+  const height = options.end - options.start;
+  if (!Number.isFinite(height) || Math.abs(height) < 1e-4) throw new Error("拉伸距离太小");
+  if (!isClosed(entity)) throw new Error("截面未封闭");
+  const frame = frameOf(plane);
+  const profile = options.sheet
+    ? makeProfileWire(kernel, frame, entity, created)
+    : options.wall > 0.05
+      ? makeWallFace(kernel, frame, entity, options.wall, created)
+      : makeProfileFace(kernel, frame, entity, created);
+  const moved = kernel.translate(profile, frame.normal.x * options.start, frame.normal.y * options.start, frame.normal.z * options.start);
+  created.push(moved);
+  const direction = scale(frame.normal, height);
+  if (!options.sheet && Math.abs(options.draftAngle) > 0.05) {
+    const drafted = kernel.draftPrism(moved, direction.x, direction.y, direction.z, options.draftAngle);
+    created.push(drafted);
+    return drafted;
+  }
+  const solid = kernel.extrude(moved, direction.x, direction.y, direction.z);
+  created.push(solid);
+  return solid;
+}
+
+export function makeRevolvedShape(
+  kernel: OcctKernel,
+  plane: PlaneFrame,
+  entity: SketchEntity,
+  axis: "u" | "v",
+  angleDeg: number,
+  created: ShapeHandle[],
+): ShapeHandle {
+  if (!isClosed(entity)) throw new Error("截面未封闭");
+  if (!Number.isFinite(angleDeg) || Math.abs(angleDeg) < 0.1) throw new Error("旋转角度太小");
+  const frame = frameOf(plane);
+  const face = makeProfileFace(kernel, frame, entity, created);
+  const direction = axis === "u" ? frame.xDir : yAxis(frame);
+  const solid = kernel.revolve(face, { point: frame.origin, direction }, (angleDeg * Math.PI) / 180);
+  created.push(solid);
+  return solid;
+}
+
+export function tessellateShape(
+  kernel: OcctKernel,
+  id: string,
+  shape: ShapeHandle,
+  quality: "preview" | "final",
+): BuiltMesh {
+  const deflection = quality === "preview"
+    ? { linearDeflection: 0.4, angularDeflection: 0.6 }
+    : { linearDeflection: 0.08, angularDeflection: 0.35 };
+  const mesh = kernel.meshShape(shape, deflection);
+  let edges = copyFloat32([]);
+  try {
+    const wire = kernel.wireframe(shape, { source: "triangulation", deflection: deflection.linearDeflection });
+    edges = edgeSegments(wire.points, wire.edgeGroups, wire.edgeCount);
+  } catch {
+    edges = copyFloat32([]);
+  }
+  return {
+    id,
+    positions: copyFloat32(mesh.positions),
+    normals: copyFloat32(mesh.normals),
+    indices: copyUint32(mesh.indices),
+    edges,
+    volume: measureVolume(kernel, shape),
+  };
+}
+
+export function measureVolume(kernel: OcctKernel, shape: ShapeHandle): number {
+  const solids = kernel.getSubShapes(shape, "solid");
+  try {
+    if (solids.length === 0) return 0;
+    try {
+      const value = kernel.getVolume(shape);
+      if (Number.isFinite(value) && Math.abs(value) > 1e-6) return value;
+    } catch {
+      // 复合体改用子实体累加。
+    }
+    let sum = 0;
+    for (const solid of solids) {
+      try {
+        const value = kernel.getVolume(solid);
+        if (Number.isFinite(value)) sum += value;
+      } catch {
+        // 跳过无法求体积的子形状。
+      }
+    }
+    return sum;
+  } finally {
+    for (const solid of solids) {
+      try {
+        kernel.release(solid);
+      } catch {
+        // 句柄已经释放时忽略。
+      }
+    }
+  }
+}
+
+function frameOf(plane: PlaneFrame): PlaneFrame {
+  return {
+    ...plane,
+    normal: normalize(plane.normal),
+    xDir: normalize(plane.xDir),
+  };
+}
+
+function makeWallFace(kernel: OcctKernel, plane: PlaneFrame, entity: SketchEntity, wall: number, created: ShapeHandle[]): ShapeHandle {
+  const outer = makeProfileWire(kernel, plane, entity, created);
+  const face = kernel.makeFace(outer);
+  created.push(face);
+  const inset = insetEntity(entity, wall);
+  if (inset) {
+    const inner = makeProfileWire(kernel, plane, inset, created);
+    const holed = kernel.addHolesInFace(face, [inner]);
+    created.push(holed);
+    return holed;
+  }
+  let failure: unknown = null;
+  for (const offset of [wall, -wall]) {
+    try {
+      const inner = kernel.offsetWire2D(outer, offset, JoinType.Intersection);
+      created.push(inner);
+      const holed = kernel.addHolesInFace(face, [inner]);
+      created.push(holed);
+      return holed;
+    } catch (error) {
+      failure = error;
+    }
+  }
+  throw failure instanceof Error ? failure : new Error("薄壁偏移失败");
+}
+
+function insetEntity(entity: SketchEntity, wall: number): SketchEntity | null {
+  if (entity.type === "rectangle") {
+    const x0 = Math.min(entity.a.x, entity.b.x) + wall;
+    const x1 = Math.max(entity.a.x, entity.b.x) - wall;
+    const y0 = Math.min(entity.a.y, entity.b.y) + wall;
+    const y1 = Math.max(entity.a.y, entity.b.y) - wall;
+    if (x1 - x0 < 0.2 || y1 - y0 < 0.2) throw new Error("薄壁厚度过大");
+    return { ...entity, a: { x: x0, y: y0 }, b: { x: x1, y: y1 } };
+  }
+  if (entity.type === "circle") {
+    if (entity.radius - wall < 0.2) throw new Error("薄壁厚度过大");
+    return { ...entity, radius: entity.radius - wall };
+  }
+  return null;
+}
+
+function makeProfileWire(kernel: OcctKernel, plane: PlaneFrame, entity: SketchEntity, created: ShapeHandle[]): ShapeHandle {
+  const edges = profileEdges(kernel, plane, entity, created);
+  const wire = kernel.makeWire(edges);
+  created.push(wire);
+  return wire;
 }
 
 function makeProfileFace(kernel: OcctKernel, plane: PlaneFrame, entity: SketchEntity, created: ShapeHandle[]): ShapeHandle {

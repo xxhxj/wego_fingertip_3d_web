@@ -1,6 +1,8 @@
 import { entityLabel } from "../model/profiles";
+import { featureSummary } from "../model/labels";
 import {
   beginExtrude,
+  beginRevolve,
   continueSketch,
   isolateBody,
   select,
@@ -40,6 +42,7 @@ export function FeatureTree() {
                 {entityLabel(entity)}
               </button>
               <button type="button" className="mini" onClick={() => beginExtrude(sketch.id, entity.id)}>拉伸</button>
+              <button type="button" className="mini" onClick={() => beginRevolve(sketch.id, entity.id)}>旋转</button>
             </div>
           ))}
         </div>
@@ -54,14 +57,15 @@ export function FeatureTree() {
           onClick={() => select({ kind: "feature", id: feature.id })}
         >
           {feature.name}
-          <small>{feature.start} → {feature.end} mm</small>
+          <small>{featureSummary(feature)}</small>
+          {editor.errors[feature.id] && <small className="danger">{editor.errors[feature.id]}</small>}
         </button>
       ))}
       <div className="section-head">
         <p className="section-label">实体</p>
         {doc.bodies.length > 0 && <button type="button" className="mini" onClick={showAllBodies}>全部显示</button>}
       </div>
-      {doc.bodies.length === 0 && <p className="empty">拉伸后会出现在这里</p>}
+      {doc.bodies.length === 0 && <p className="empty">成型后会出现在这里</p>}
       {doc.bodies.map((body) => (
         <div key={body.id} className={rowClass(selection?.kind === "body" && selection.id === body.id)}>
           <button type="button" className="row-main" onClick={() => select({ kind: "body", id: body.id })}>

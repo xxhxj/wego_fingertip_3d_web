@@ -3,8 +3,11 @@ import {
   beginExtrude,
   cancelDraft,
   cancelExtrude,
+  cancelRevolve,
+  cancelBoolean,
   closePolyline,
   confirmExtrude,
+  confirmRevolve,
   deleteSelection,
   finishSketch,
   getState,
@@ -41,15 +44,19 @@ export function App() {
         return;
       }
       if (event.key === "Escape") {
-        if (getState().extrudeDraft) cancelExtrude();
+        const current = getState();
+        if (current.extrudeDraft) cancelExtrude();
+        else if (current.revolveDraft) cancelRevolve();
+        else if (current.pendingBoolean) cancelBoolean();
         else if (getGesture().draft) cancelDraft();
-        else if (getState().activeSketchId) finishSketch();
+        else if (current.activeSketchId) finishSketch();
         else setTool("select");
         return;
       }
       if (event.key === "Enter") {
         if (getState().tool === "polyline") closePolyline();
         else if (getState().extrudeDraft) confirmExtrude();
+        else if (getState().revolveDraft) confirmRevolve();
         return;
       }
       if (event.key === "Delete" || event.key === "Backspace") {

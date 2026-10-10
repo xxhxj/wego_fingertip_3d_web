@@ -66,24 +66,29 @@ button.danger-button { color: #b42318; border-color: #f0c7c3; background: #fff; 
 .workspace { flex: 1; min-height: 0; display: flex; }
 
 .rail {
-  width: 76px;
+  width: 84px;
   padding: 8px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   background: #f7f8fa;
   border-right: 1px solid #d5dbe3;
+  overflow: auto;
 }
 
+.rail-group { display: flex; flex-direction: column; gap: 4px; }
+.rail-group > span { font-size: 11px; color: #5d6b7c; text-align: center; }
+
 .rail button {
-  height: 58px;
+  height: 48px;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  padding: 4px;
-  font-size: 12px;
+  gap: 2px;
+  padding: 2px;
+  font-size: 11px;
 }
 
 .rail button.active { background: #e7f0ff; border-color: #1f6feb; color: #1f6feb; }
@@ -139,7 +144,7 @@ button.danger-button { color: #b42318; border-color: #f0c7c3; background: #fff; 
 
 .tree { flex: 1; }
 
-.props { flex: 0 0 280px; border-top: 1px solid #d5dbe3; }
+.props { flex: 0 1 360px; min-height: 200px; border-top: 1px solid #d5dbe3; }
 
 h2 { margin: 0 0 10px; font-size: 15px; }
 
@@ -172,6 +177,7 @@ h2 { margin: 0 0 10px; font-size: 15px; }
   text-align: left;
 }
 
+.tree > button { height: auto; flex-wrap: wrap; }
 .row small, .tree > button small { margin-left: auto; color: #5d6b7c; }
 
 .mini { padding: 3px 7px; font-size: 12px; }
@@ -186,7 +192,7 @@ h2 { margin: 0 0 10px; font-size: 15px; }
 
 .field, .check { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; font-size: 12px; color: #5d6b7c; }
 
-.field input[type="number"], .field input[type="color"] {
+.field input[type="number"], .field input[type="color"], .field select {
   width: 100%;
   border: 1px solid #d5dbe3;
   border-radius: 8px;

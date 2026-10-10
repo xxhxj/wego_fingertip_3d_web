@@ -552,7 +552,7 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
           ? currentState.doc.bodies.find((body) => body.id === picked.id)?.featureId
           : undefined;
       const feature = currentState.doc.features.find((item) => item.id === featureId);
-      if (!feature) return null;
+      if (!feature || feature.type !== "extrude") return null;
       const located = locate(feature.sketchId, feature.entityId);
       if (!located) return null;
       return { mode: "feature", featureId: feature.id, ...located, start: feature.start, end: feature.end };

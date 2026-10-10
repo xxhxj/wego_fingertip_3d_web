@@ -1,4 +1,5 @@
-import type { BuildJob, BuildResult } from "./build";
+import type { BuildResult } from "./build";
+import type { ReplayRequest } from "./protocol";
 
 let worker: Worker | null = null;
 let ready: Promise<void> | null = null;
@@ -31,7 +32,7 @@ export function initKernel(): Promise<void> {
   return ready;
 }
 
-export function replay(jobs: BuildJob[]): Promise<BuildResult[]> {
+export function replay(model: ReplayRequest): Promise<BuildResult[]> {
   const current = getWorker();
   const id = requestId;
   requestId += 1;
@@ -43,6 +44,6 @@ export function replay(jobs: BuildJob[]): Promise<BuildResult[]> {
       else resolve(event.data.results as BuildResult[]);
     };
     current.addEventListener("message", onMessage);
-    current.postMessage({ type: "replay", id, jobs });
+    current.postMessage({ type: "replay", id, model });
   });
 }

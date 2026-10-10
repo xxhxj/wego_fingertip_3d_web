@@ -1,6 +1,8 @@
 import wasmUrl from "occt-wasm/dist/occt-wasm.wasm?url";
 import { OcctKernel } from "occt-wasm";
-import { buildExtrusion, type BuildJob, type BuildResult } from "./build";
+import type { BuildResult } from "./build";
+import type { ReplayRequest } from "./protocol";
+import { replayModel } from "./replay";
 
 let kernelPromise: Promise<OcctKernel> | null = null;
 
@@ -11,7 +13,7 @@ function loadKernel(): Promise<OcctKernel> {
 
 const post = self.postMessage.bind(self) as (message: unknown, transfer?: Transferable[]) => void;
 
-self.onmessage = (event: MessageEvent<{ type: string; id?: number; jobs?: BuildJob[] }>) => {
+self.onmessage = (event: MessageEvent<{ type: string; id?: number; model?: ReplayRequest }>) => {
   const message = event.data;
   if (message.type === "init") {
     loadKernel()
@@ -21,12 +23,12 @@ self.onmessage = (event: MessageEvent<{ type: string; id?: number; jobs?: BuildJ
       });
     return;
   }
-  if (message.type !== "replay" || message.id == null || !message.jobs) return;
+  if (message.type !== "replay" || message.id == null || !message.model) return;
   const requestId = message.id;
-  const jobs = message.jobs;
+  const model = message.model;
   loadKernel()
     .then((kernel) => {
-      const results: BuildResult[] = jobs.map((job) => buildExtrusion(kernel, job));
+      const results: BuildResult[] = replayModel(kernel, model);
       const transfer: ArrayBuffer[] = [];
       for (const result of results) {
         if ("positions" in result) {

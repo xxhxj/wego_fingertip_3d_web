@@ -140,6 +140,24 @@ try {
   if (!colors[0].endsWith(":false")) throw new Error("第一个实体没有隐藏");
 
   await page.evaluate(() => window.__wego.showAllBodies());
+  await page.evaluate(() => {
+    const body = window.__wego.getState().doc.bodies[1];
+    window.__wego.select({ kind: "body", id: body.id });
+    window.__wego.setTool("fillet");
+  });
+  await page.waitForFunction(() => {
+    const state = window.__wego.getState();
+    const feature = state.doc.features.find((item) => item.type === "fillet");
+    const body = state.doc.bodies[1];
+    if (!feature || !body) return false;
+    if (state.errors[feature.id]) return true;
+    return state.volumes[body.id] > 0 && state.volumes[body.id] < 7900;
+  }, { timeout: 20000 });
+  const filletError = await page.evaluate(() => {
+    const feature = window.__wego.getState().doc.features.find((item) => item.type === "fillet");
+    return feature ? window.__wego.getState().errors[feature.id] || "" : "没有圆角特征";
+  });
+  if (filletError) throw new Error(`圆角失败: ${filletError}`);
   const shot = join(await mkdtemp(join(tmpdir(), "wego-cad-")), "viewport.png");
   await page.screenshot({ path: shot });
   console.log(`screenshot ${shot}`);

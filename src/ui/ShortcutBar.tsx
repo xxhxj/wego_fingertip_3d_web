@@ -1,4 +1,4 @@
-import { beginExtrude, deleteSelection, isolateBody, setBodyVisible, showAllBodies, startSketch } from "../state/editor";
+import { beginExtrude, beginRevolve, deleteSelection, isolateBody, setBodyVisible, showAllBodies, startSketch } from "../state/editor";
 import { useEditor } from "../state/hooks";
 
 export function ShortcutBar() {
@@ -13,7 +13,10 @@ export function ShortcutBar() {
     <div className="shortcut" style={{ left, top }}>
       {selection.kind === "plane" && <button type="button" onClick={() => startSketch(selection.id)}>在此开草图</button>}
       {selection.kind === "entity" && (
-        <button type="button" onClick={() => beginExtrude(selection.sketchId, selection.entityId)}>拉伸</button>
+        <>
+          <button type="button" onClick={() => beginExtrude(selection.sketchId, selection.entityId)}>拉伸</button>
+          <button type="button" onClick={() => beginRevolve(selection.sketchId, selection.entityId)}>旋转</button>
+        </>
       )}
       {selection.kind === "body" && (
         <>
