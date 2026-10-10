@@ -1,10 +1,12 @@
-import { replay, initKernel } from "../kernel/client";
+import { replay, initKernel, exportStep, pickEdge } from "../kernel/client";
 import { isBuiltMesh, type BuildResult } from "../kernel/build";
 import type { ReplayRequest } from "../kernel/protocol";
 import { BODY_COLORS, cloneDoc, createDocument, uid } from "../model/document";
+import { resolveDocumentPlanes } from "../model/planes";
 import { entityLabel, isClosed } from "../model/profiles";
 import type {
   DocumentModel,
+  EdgeRef,
   ExtrudeDraft,
   Feature,
   PendingBoolean,
@@ -38,6 +40,8 @@ export interface EditorState {
   extrudeDraft: ExtrudeDraft | null;
   revolveDraft: RevolveDraft | null;
   pendingBoolean: PendingBoolean | null;
+  pendingBisect: string | null;
+  edgePick: boolean;
   status: string;
   kernel: "loading" | "ready" | "error";
   kernelMessage: string;
@@ -63,6 +67,8 @@ let state: EditorState = {
   extrudeDraft: null,
   revolveDraft: null,
   pendingBoolean: null,
+  pendingBisect: null,
+  edgePick: false,
   status: "选择一个基准面，然后开始草图。",
   kernel: "loading",
   kernelMessage: "正在加载 Open CASCADE…",
@@ -198,6 +204,7 @@ function commitDoc(recipe: (document: DocumentModel) => void, extra: Partial<Edi
   transientAnchor = null;
   const next = cloneDoc(state.doc);
   recipe(next);
+  resolveDocumentPlanes(next);
   update({
     past: [...state.past, state.doc].slice(-100),
     future: [],
@@ -212,6 +219,7 @@ function commitDoc(recipe: (document: DocumentModel) => void, extra: Partial<Edi
 function writeTransient(recipe: (document: DocumentModel) => void, shouldReplay: boolean): void {
   const next = cloneDoc(state.doc);
   recipe(next);
+  resolveDocumentPlanes(next);
   if (transientAnchor) update({ doc: next });
   else {
     update({
@@ -322,10 +330,15 @@ export function select(selection: Selection | null, pointer: { x: number; y: num
     applyBoolean(pending.operation, pending.targetBodyId, selection.id);
     return;
   }
+  if (state.pendingBisect && selection?.kind === "plane" && selection.id !== state.pendingBisect) {
+    createBisect(state.pendingBisect, selection.id);
+    return;
+  }
   update({
     selection,
     pointer,
     pendingBoolean: pending && selection?.kind === "body" ? pending : null,
+    pendingBisect: state.pendingBisect && selection?.kind === "plane" ? state.pendingBisect : null,
     tool: pending && selection?.kind !== "body" ? "select" : state.tool,
   });
 }
@@ -370,7 +383,7 @@ export function setTool(tool: Tool): void {
     return;
   }
   const hadPreview = state.extrudeDraft != null || state.revolveDraft != null;
-  update({ tool, extrudeDraft: null, revolveDraft: null, pendingBoolean: null });
+  update({ tool, extrudeDraft: null, revolveDraft: null, pendingBoolean: null, pendingBisect: null, edgePick: false });
   setGesture({ draft: null, readout: "" });
   if (hadPreview) scheduleReplay();
 }
@@ -598,6 +611,9 @@ export function confirmExtrude(): void {
       color,
       visible: true,
       featureId,
+      deflection: 0.08,
+      faceDeflection: null,
+      faceDirection: null,
     });
   }, {
     extrudeDraft: null,
@@ -634,6 +650,182 @@ export function editFeature(featureId: string, recipe: (feature: Feature) => voi
   }, true);
 }
 
+export function createOffsetPlane(sourceId: string, distance = 10): void {
+  const source = state.doc.planes.find((plane) => plane.id === sourceId);
+  if (!source) return;
+  const id = uid("pl");
+  commitDoc((document) => {
+    document.planes.push(blankPlane(id, `偏置 ${document.planes.length - 2}`, "offset", sourceId, null, distance, 0));
+  }, { selection: { kind: "plane", id }, status: "已生成偏置平面。距离沿来源法向。" }, false);
+}
+
+export function createAngledPlane(sourceId: string, angleDeg = 30): void {
+  const source = state.doc.planes.find((plane) => plane.id === sourceId);
+  if (!source) return;
+  const id = uid("pl");
+  commitDoc((document) => {
+    document.planes.push(blankPlane(id, `斜面 ${document.planes.length - 2}`, "angled", sourceId, null, 0, angleDeg));
+  }, { selection: { kind: "plane", id }, status: "已生成斜平面。角度绕来源平面的 U 轴。" }, false);
+}
+
+export function beginBisect(planeId: string): void {
+  update({ pendingBisect: planeId, pendingBoolean: null, edgePick: false, status: "再点另一个平面，生成它们的等分面。" });
+}
+
+export function editPlane(planeId: string, patch: { distance?: number; angleDeg?: number }): void {
+  writeTransient((document) => {
+    const plane = document.planes.find((item) => item.id === planeId);
+    if (!plane || plane.kind === "principal") return;
+    if (patch.distance != null && Number.isFinite(patch.distance)) plane.distance = Math.max(-2000, Math.min(2000, patch.distance));
+    if (patch.angleDeg != null && Number.isFinite(patch.angleDeg)) plane.angleDeg = Math.max(-360, Math.min(360, patch.angleDeg));
+  }, false);
+}
+
+export function setBodyMesh(bodyId: string, patch: { deflection?: number; faceDeflection?: number | null; faceDirection?: { x: number; y: number; z: number } | null }): void {
+  writeTransient((document) => {
+    const body = document.bodies.find((item) => item.id === bodyId);
+    if (!body) return;
+    if (patch.deflection != null && Number.isFinite(patch.deflection)) body.deflection = Math.max(0.01, Math.min(5, patch.deflection));
+    if (patch.faceDeflection !== undefined) body.faceDeflection = patch.faceDeflection == null ? null : Math.max(0.01, Math.min(5, patch.faceDeflection));
+    if (patch.faceDirection !== undefined) body.faceDirection = patch.faceDirection;
+  }, true);
+}
+
+export async function downloadStep(): Promise<void> {
+  if (state.kernel !== "ready") {
+    update({ status: "几何内核还没就绪。" });
+    return;
+  }
+  try {
+    const step = await exportStep(collectModel(state), selectedBodyId());
+    const blob = new Blob([step], { type: "application/step" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "wego.step";
+    link.click();
+    URL.revokeObjectURL(url);
+    update({ status: "已导出 STEP。" });
+  } catch (error) {
+    update({ status: error instanceof Error ? error.message : "导出失败" });
+  }
+}
+
+export function importStepText(text: string, fileName: string): void {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("ISO-10303-21")) {
+    update({ status: "这不是 STEP 文件。" });
+    return;
+  }
+  const featureId = uid("ft");
+  const bodyId = uid("bd");
+  const name = fileName.replace(/\.(step|stp)$/i, "") || "STEP";
+  commitDoc((document) => {
+    document.features.push({ id: featureId, type: "step", name, bodyId, step: trimmed });
+    pushBody(document, bodyId, featureId);
+  }, { selection: { kind: "body", id: bodyId }, tool: "select", status: "已导入 STEP。它会作为一条特征参与重放。" });
+}
+
+export function beginEdgePick(): void {
+  if (!selectedBodyId()) {
+    update({ status: "先选中一个实体，再点选要倒圆的边。", edgePick: false });
+    return;
+  }
+  update({ edgePick: true, pendingBoolean: null, pendingBisect: null, status: "点一条边。圆角会记住这条边的位置，重建后按位置找回。" });
+}
+
+export function cancelEdgePick(): void {
+  if (!state.edgePick && !state.pendingBisect) return;
+  update({ edgePick: false, pendingBisect: null, status: "已取消。" });
+}
+
+export async function pickEdgeAt(bodyId: string, point: { x: number; y: number; z: number }): Promise<void> {
+  try {
+    const edge = await pickEdge(collectModel(state), bodyId, point);
+    addFilletEdge(bodyId, edge);
+  } catch (error) {
+    update({ edgePick: false, status: error instanceof Error ? error.message : "选边失败" });
+  }
+}
+
+function addFilletEdge(bodyId: string, edge: EdgeRef): void {
+  const existing = state.doc.features.find((feature) => feature.type === "fillet" && feature.bodyId === bodyId && feature.edges != null);
+  if (existing && existing.type === "fillet") {
+    commitDoc((document) => {
+      const feature = document.features.find((item) => item.id === existing.id);
+      if (feature?.type === "fillet") feature.edges = [...(feature.edges ?? []), edge];
+    }, { edgePick: false, selection: { kind: "feature", id: existing.id }, status: "已加入一条边。" });
+    return;
+  }
+  const featureId = uid("ft");
+  commitDoc((document) => {
+    document.features.push({
+      id: featureId,
+      type: "fillet",
+      name: featureName(document, "fillet", "圆角"),
+      bodyId,
+      radius: 2,
+      edges: [edge],
+    });
+  }, { edgePick: false, tool: "select", selection: { kind: "feature", id: featureId }, status: "已对选中的边倒圆。" });
+}
+
+function createBisect(sourceId: string, peerId: string): void {
+  const id = uid("pl");
+  commitDoc((document) => {
+    document.planes.push(blankPlane(id, `等分 ${document.planes.length - 2}`, "bisect", sourceId, peerId, 0, 0));
+  }, { pendingBisect: null, selection: { kind: "plane", id }, status: "已生成等分平面。" }, false);
+}
+
+function blankPlane(
+  id: string,
+  name: string,
+  kind: "offset" | "bisect" | "angled",
+  sourceId: string,
+  peerId: string | null,
+  distance: number,
+  angleDeg: number,
+) {
+  return {
+    id,
+    name,
+    kind,
+    sourceId,
+    peerId,
+    distance,
+    angleDeg,
+    origin: { x: 0, y: 0, z: 0 },
+    normal: { x: 0, y: 0, z: 1 },
+    xDir: { x: 1, y: 0, z: 0 },
+  };
+}
+
+function removePlane(document: DocumentModel, planeId: string): void {
+  const drop = new Set<string>([planeId]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const plane of document.planes) {
+      if (drop.has(plane.id)) continue;
+      if ((plane.sourceId && drop.has(plane.sourceId)) || (plane.peerId && drop.has(plane.peerId))) {
+        drop.add(plane.id);
+        grew = true;
+      }
+    }
+  }
+  const entityIds = new Set(
+    document.sketches.filter((sketch) => drop.has(sketch.planeId)).flatMap((sketch) => sketch.entities.map((entity) => entity.id)),
+  );
+  document.planes = document.planes.filter((plane) => !drop.has(plane.id));
+  document.sketches = document.sketches.filter((sketch) => !drop.has(sketch.planeId));
+  if (entityIds.size > 0) {
+    removeFeatures(document, (feature) => {
+      const profile = profileOf(feature);
+      return profile != null && entityIds.has(profile.entityId);
+    });
+  }
+}
+
 export function setBodyVisible(bodyId: string, visible: boolean): void {
   commitDoc((document) => {
     const body = document.bodies.find((item) => item.id === bodyId);
@@ -662,7 +854,18 @@ export function showAllBodies(): void {
 
 export function deleteSelection(): void {
   const selection = state.selection;
-  if (!selection || selection.kind === "plane") return;
+  if (!selection) return;
+  if (selection.kind === "plane") {
+    const plane = state.doc.planes.find((item) => item.id === selection.id);
+    if (!plane || plane.kind === "principal") {
+      update({ status: "三个基准面保留。可以基于它们做偏置、等分或斜面。" });
+      return;
+    }
+    commitDoc((document) => {
+      removePlane(document, plane.id);
+    }, { selection: null, status: "已删除构造平面。" });
+    return;
+  }
   if (selection.kind === "body") {
     const body = state.doc.bodies.find((item) => item.id === selection.id);
     if (body) deleteFeature(body.featureId);
@@ -848,6 +1051,7 @@ function applyBoolean(operation: PendingBoolean["operation"], targetBodyId: stri
       operation,
       targetBodyId,
       toolBodyId,
+      fuzzy: 0,
     });
     const tool = document.bodies.find((body) => body.id === toolBodyId);
     if (tool) tool.visible = false;
@@ -871,7 +1075,7 @@ function applyBodyTool(tool: "fillet" | "chamfer" | "shell" | "move" | "copy" | 
   const newBodyId = tool === "copy" || tool === "mirror" ? uid("bd") : null;
   commitDoc((document) => {
     if (tool === "fillet") {
-      document.features.push({ id: featureId, type: "fillet", name: featureName(document, "fillet", "圆角"), bodyId, radius: 2 });
+      document.features.push({ id: featureId, type: "fillet", name: featureName(document, "fillet", "圆角"), bodyId, radius: 2, edges: null });
     } else if (tool === "chamfer") {
       document.features.push({ id: featureId, type: "chamfer", name: featureName(document, "chamfer", "倒角"), bodyId, distance: 2 });
     } else if (tool === "shell") {
@@ -968,6 +1172,9 @@ function pushBody(document: DocumentModel, bodyId: string, featureId: string): v
     color: BODY_COLORS[document.bodies.length % BODY_COLORS.length],
     visible: true,
     featureId,
+    deflection: 0.08,
+    faceDeflection: null,
+    faceDirection: null,
   });
 }
 
@@ -994,6 +1201,8 @@ function referencedBodyIds(feature: Feature): string[] {
     case "shell":
     case "linearPattern":
     case "circularPattern":
+      return [feature.bodyId];
+    case "step":
       return [feature.bodyId];
     case "move":
       return feature.newBodyId ? [feature.bodyId, feature.newBodyId] : [feature.bodyId];

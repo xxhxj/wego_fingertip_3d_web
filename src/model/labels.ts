@@ -15,8 +15,12 @@ export function featureSummary(feature: Feature): string {
     }
     case "boolean":
       return feature.operation === "fuse" ? "并集" : feature.operation === "cut" ? "差集" : "交集";
+    case "step":
+      return "STEP";
     case "fillet":
-      return `R${feature.radius} mm`;
+      return feature.edges && feature.edges.length > 0
+        ? `R${feature.radius} mm · ${feature.edges.length} 条边`
+        : `R${feature.radius} mm · 全部边`;
     case "chamfer":
       return `${feature.distance} mm`;
     case "shell":

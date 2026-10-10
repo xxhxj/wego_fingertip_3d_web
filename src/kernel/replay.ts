@@ -1,7 +1,7 @@
-import { JoinType, type OcctKernel, type ShapeHandle } from "occt-wasm";
+import { BooleanOp, JoinType, type OcctKernel, type ShapeHandle } from "occt-wasm";
 import { normalize } from "../model/math";
-import type { Feature, PlaneFrame, SketchEntity, Vec3 } from "../model/types";
-import { makeExtrudedShape, makeRevolvedShape, tessellateShape, type BuildResult } from "./build";
+import type { EdgeRef, Feature, PlaneFrame, SketchEntity, Vec3 } from "../model/types";
+import { makeExtrudedShape, makeRevolvedShape, tessellateShape, type BuildResult, type MeshOptions } from "./build";
 import type { ReplayPreview, ReplayRequest } from "./protocol";
 
 /**
@@ -10,16 +10,10 @@ import type { ReplayPreview, ReplayRequest } from "./protocol";
  */
 export function replayModel(kernel: OcctKernel, request: ReplayRequest): BuildResult[] {
   const created: ShapeHandle[] = [];
-  const shapes = new Map<string, ShapeHandle>();
   const results: BuildResult[] = [];
   try {
-    for (const feature of request.features) {
-      try {
-        applyFeature(kernel, request, feature, shapes, created);
-      } catch (error) {
-        results.push({ id: feature.id, error: messageOf(error) });
-      }
-    }
+    const built = buildShapeMap(kernel, request, created);
+    results.push(...built.errors);
     if (request.preview) {
       try {
         const shape = previewShape(kernel, request, request.preview, created);
@@ -29,10 +23,15 @@ export function replayModel(kernel: OcctKernel, request: ReplayRequest): BuildRe
       }
     }
     for (const body of request.bodies) {
-      const shape = shapes.get(body.id);
+      const shape = built.shapes.get(body.id);
       if (!shape) continue;
       try {
-        results.push(tessellateShape(kernel, body.id, shape, "final"));
+        const meshOptions: MeshOptions = {};
+        if ((body.deflection ?? 0) > 0) meshOptions.linearDeflection = body.deflection;
+        if ((body.faceDeflection ?? 0) > 0 && body.faceDirection) {
+          meshOptions.face = { direction: body.faceDirection, linearDeflection: body.faceDeflection ?? 0.08 };
+        }
+        results.push(tessellateShape(kernel, body.id, shape, "final", meshOptions));
       } catch (error) {
         results.push({ id: body.id, error: messageOf(error) });
       }
@@ -84,6 +83,14 @@ function applyFeature(
   if (feature.type === "boolean") {
     const base = requireShape(shapes, feature.targetBodyId);
     const tool = requireShape(shapes, feature.toolBodyId);
+    const fuzzy = feature.fuzzy ?? 0;
+    if (fuzzy > 1e-6) {
+      const op = feature.operation === "fuse" ? BooleanOp.Fuse : feature.operation === "cut" ? BooleanOp.Cut : BooleanOp.Common;
+      const evolved = kernel.booleanOp(op, [base], [tool], { fuzzyValue: fuzzy });
+      created.push(evolved.result);
+      shapes.set(feature.targetBodyId, evolved.result);
+      return;
+    }
     const result = feature.operation === "fuse"
       ? kernel.fuse(base, tool)
       : feature.operation === "cut"
@@ -95,8 +102,15 @@ function applyFeature(
   }
   if (feature.type === "fillet" || feature.type === "chamfer") {
     const size = feature.type === "fillet" ? feature.radius : feature.distance;
-    const result = blendEdges(kernel, requireShape(shapes, feature.bodyId), size, feature.type, created);
+    const refs = feature.type === "fillet" ? feature.edges : null;
+    const result = blendEdges(kernel, requireShape(shapes, feature.bodyId), size, feature.type, refs ?? null, created);
     shapes.set(feature.bodyId, result);
+    return;
+  }
+  if (feature.type === "step") {
+    const imported = kernel.importStep(feature.step);
+    created.push(imported);
+    shapes.set(feature.bodyId, imported);
     return;
   }
   if (feature.type === "shell") {
@@ -194,11 +208,14 @@ function blendEdges(
   shape: ShapeHandle,
   size: number,
   kind: "fillet" | "chamfer",
+  refs: EdgeRef[] | null,
   created: ShapeHandle[],
 ): ShapeHandle {
   if (!(size > 0.05)) throw new Error(kind === "fillet" ? "圆角半径太小" : "倒角距离太小");
   const solid = primarySolid(kernel, shape, created);
-  const original = take(kernel, solid, "edge", created);
+  const original = refs && refs.length > 0
+    ? matchEdges(kernel, solid, refs, created)
+    : take(kernel, solid, "edge", created);
   if (original.length === 0) throw new Error(kind === "fillet" ? "没有可圆角的边" : "没有可倒角的边");
   const blend = (target: ShapeHandle, edges: ShapeHandle[]) => (
     kind === "fillet" ? kernel.fillet(target, edges, size) : kernel.chamfer(target, edges, size)
@@ -282,6 +299,126 @@ function take(
   const handles = kernel.getSubShapes(shape, type);
   created.push(...handles);
   return handles;
+}
+
+function buildShapeMap(
+  kernel: OcctKernel,
+  request: ReplayRequest,
+  created: ShapeHandle[],
+): { shapes: Map<string, ShapeHandle>; errors: BuildResult[] } {
+  const shapes = new Map<string, ShapeHandle>();
+  const errors: BuildResult[] = [];
+  for (const feature of request.features) {
+    try {
+      applyFeature(kernel, request, feature, shapes, created);
+    } catch (error) {
+      errors.push({ id: feature.id, error: messageOf(error) });
+    }
+  }
+  return { shapes, errors };
+}
+
+export function exportStepModel(kernel: OcctKernel, request: ReplayRequest, bodyId: string | null): string {
+  const created: ShapeHandle[] = [];
+  try {
+    const { shapes } = buildShapeMap(kernel, request, created);
+    const chosen = bodyId
+      ? [shapes.get(bodyId)].filter((shape): shape is ShapeHandle => shape != null)
+      : [...shapes.values()];
+    if (chosen.length === 0) throw new Error("没有可导出的实体");
+    if (chosen.length === 1) return kernel.exportStep(chosen[0]);
+    const compound = kernel.makeCompound(chosen);
+    created.push(compound);
+    return kernel.exportStep(compound);
+  } finally {
+    releaseAll(kernel, created);
+  }
+}
+
+export function pickEdgeOnBody(kernel: OcctKernel, request: ReplayRequest, bodyId: string, point: Vec3): EdgeRef {
+  const created: ShapeHandle[] = [];
+  try {
+    const { shapes } = buildShapeMap(kernel, request, created);
+    const shape = shapes.get(bodyId);
+    if (!shape) throw new Error("目标实体还没有生成");
+    const solid = primarySolid(kernel, shape, created);
+    const edges = take(kernel, solid, "edge", created);
+    let best: EdgeRef | null = null;
+    let bestDistance = Infinity;
+    for (const edge of edges) {
+      const ref = signatureOf(kernel, edge);
+      const distance = Math.hypot(ref.midpoint.x - point.x, ref.midpoint.y - point.y, ref.midpoint.z - point.z);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = ref;
+      }
+    }
+    if (!best) throw new Error("没有可选择的边");
+    return best;
+  } finally {
+    releaseAll(kernel, created);
+  }
+}
+
+function matchEdges(kernel: OcctKernel, solid: ShapeHandle, refs: EdgeRef[], created: ShapeHandle[]): ShapeHandle[] {
+  const edges = take(kernel, solid, "edge", created);
+  const known = edges.map((edge) => ({ edge, ref: signatureOf(kernel, edge) }));
+  const chosen: ShapeHandle[] = [];
+  for (const wanted of refs) {
+    let best: { edge: ShapeHandle; ref: EdgeRef } | null = null;
+    let bestScore = Infinity;
+    for (const item of known) {
+      const distance = Math.hypot(
+        item.ref.midpoint.x - wanted.midpoint.x,
+        item.ref.midpoint.y - wanted.midpoint.y,
+        item.ref.midpoint.z - wanted.midpoint.z,
+      );
+      const score = distance + Math.abs(item.ref.length - wanted.length) * 0.25;
+      if (score < bestScore) {
+        bestScore = score;
+        best = item;
+      }
+    }
+    const limit = Math.max(1.5, wanted.length * 0.08);
+    if (!best || bestScore > limit) throw new Error("找不到对应的边");
+    chosen.push(best.edge);
+  }
+  return chosen;
+}
+
+function signatureOf(kernel: OcctKernel, edge: ShapeHandle): EdgeRef {
+  const box = kernel.getBoundingBox(edge);
+  const seed = {
+    x: (box.xmin + box.xmax) / 2,
+    y: (box.ymin + box.ymax) / 2,
+    z: (box.zmin + box.zmax) / 2,
+  };
+  let midpoint = seed;
+  let direction = { x: 0, y: 0, z: 1 };
+  try {
+    const projected = kernel.projectPointOnEdge(edge, seed);
+    midpoint = projected.point;
+    direction = normalize(projected.tangent);
+  } catch {
+    midpoint = seed;
+  }
+  let length = 0;
+  try {
+    length = kernel.curveLength(edge);
+  } catch {
+    length = Math.hypot(box.xmax - box.xmin, box.ymax - box.ymin, box.zmax - box.zmin);
+  }
+  return { midpoint, direction, length };
+}
+
+function releaseAll(kernel: OcctKernel, created: ShapeHandle[]): void {
+  for (let index = created.length - 1; index >= 0; index -= 1) {
+    try {
+      kernel.release(created[index]);
+    } catch {
+      // 句柄已经释放时忽略。
+    }
+  }
 }
 
 function messageOf(error: unknown): string {

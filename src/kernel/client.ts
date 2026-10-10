@@ -1,5 +1,6 @@
 import type { BuildResult } from "./build";
 import type { ReplayRequest } from "./protocol";
+import type { EdgeRef, Vec3 } from "../model/types";
 
 let worker: Worker | null = null;
 let ready: Promise<void> | null = null;
@@ -33,17 +34,29 @@ export function initKernel(): Promise<void> {
 }
 
 export function replay(model: ReplayRequest): Promise<BuildResult[]> {
+  return request<BuildResult[]>("replay", { model }, (data) => data.results as BuildResult[]);
+}
+
+export function exportStep(model: ReplayRequest, bodyId: string | null): Promise<string> {
+  return request<string>("export-step", { model, bodyId }, (data) => String(data.step ?? ""));
+}
+
+export function pickEdge(model: ReplayRequest, bodyId: string, point: Vec3): Promise<EdgeRef> {
+  return request<EdgeRef>("pick-edge", { model, bodyId, point }, (data) => data.edge as EdgeRef);
+}
+
+function request<T>(type: string, payload: Record<string, unknown>, read: (data: Record<string, unknown>) => T): Promise<T> {
   const current = getWorker();
   const id = requestId;
   requestId += 1;
   return new Promise((resolve, reject) => {
     const onMessage = (event: MessageEvent) => {
-      if (event.data?.type !== "replay" || event.data.id !== id) return;
+      if (event.data?.type !== type || event.data.id !== id) return;
       current.removeEventListener("message", onMessage);
       if (event.data.error) reject(new Error(event.data.error));
-      else resolve(event.data.results as BuildResult[]);
+      else resolve(read(event.data as Record<string, unknown>));
     };
     current.addEventListener("message", onMessage);
-    current.postMessage({ type: "replay", id, model });
+    current.postMessage({ type, id, ...payload });
   });
 }

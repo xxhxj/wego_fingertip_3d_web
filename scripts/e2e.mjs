@@ -158,6 +158,12 @@ try {
     return feature ? window.__wego.getState().errors[feature.id] || "" : "没有圆角特征";
   });
   if (filletError) throw new Error(`圆角失败: ${filletError}`);
+  await page.evaluate(() => window.__wego.createOffsetPlane("plane-xy", 12));
+  const offsetPlane = await page.evaluate(() => {
+    const plane = window.__wego.getState().doc.planes.find((item) => item.kind === "offset");
+    return plane ? plane.origin.z : null;
+  });
+  if (Math.abs(offsetPlane - 12) > 1e-6) throw new Error(`偏置平面不对: ${offsetPlane}`);
   const shot = join(await mkdtemp(join(tmpdir(), "wego-cad-")), "viewport.png");
   await page.screenshot({ path: shot });
   console.log(`screenshot ${shot}`);

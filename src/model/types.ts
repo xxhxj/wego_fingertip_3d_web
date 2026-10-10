@@ -15,10 +15,26 @@ export interface PlaneFrame {
   xDir: Vec3;
 }
 
+export interface EdgeRef {
+  /** 边上的一点，重建后用来找回同一条棱。 */
+  midpoint: Vec3;
+  /** 该点处的单位切向。 */
+  direction: Vec3;
+  length: number;
+}
+
 export interface DatumPlane extends PlaneFrame {
   id: string;
   name: string;
-  kind: "principal";
+  kind: "principal" | "offset" | "bisect" | "angled";
+  /** 偏置和斜面的来源平面。等分时是第一个平面。 */
+  sourceId: string | null;
+  /** 等分的第二个平面。 */
+  peerId: string | null;
+  /** 沿来源法向的偏置距离，单位 mm。 */
+  distance: number;
+  /** 绕来源 U 轴的转角，单位度。 */
+  angleDeg: number;
 }
 
 export type SketchEntity =
@@ -74,6 +90,8 @@ export interface BooleanFeature {
   operation: "fuse" | "cut" | "common";
   targetBodyId: string;
   toolBodyId: string;
+  /** 大于 0 时按该公差缝合接近重合的面，单位 mm。 */
+  fuzzy: number;
 }
 
 export interface FilletFeature {
@@ -82,6 +100,8 @@ export interface FilletFeature {
   name: string;
   bodyId: string;
   radius: number;
+  /** 为空时倒圆全部边。否则只倒这些边。 */
+  edges: EdgeRef[] | null;
 }
 
 export interface ChamferFeature {
@@ -153,7 +173,16 @@ export type Feature =
   | MoveFeature
   | MirrorFeature
   | LinearPatternFeature
-  | CircularPatternFeature;
+  | CircularPatternFeature
+  | StepFeature;
+
+export interface StepFeature {
+  id: string;
+  type: "step";
+  name: string;
+  bodyId: string;
+  step: string;
+}
 
 export interface Body {
   id: string;
@@ -161,6 +190,11 @@ export interface Body {
   color: string;
   visible: boolean;
   featureId: string;
+  /** 整体弦高，单位 mm。越小越细。 */
+  deflection: number;
+  /** 与 faceDirection 最接近的那个面使用这个弦高。 */
+  faceDeflection: number | null;
+  faceDirection: Vec3 | null;
 }
 
 export interface DocumentModel {

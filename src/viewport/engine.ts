@@ -15,6 +15,7 @@ import {
   setDraftDistances,
   setFeatureDistances,
   setViewportMessage,
+  pickEdgeAt,
   subscribe,
 } from "../state/editor";
 import { getGesture, setGesture, subscribeGesture } from "../state/gesture";
@@ -110,33 +111,7 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
     const handleGroup = new THREE.Group();
     scene.add(planeGroup, bodyGroup, sketchGroup, handleGroup);
 
-    const planeColors: Record<string, number> = {
-      "plane-xy": 0x2f9e6b,
-      "plane-xz": 0x2f6fed,
-      "plane-yz": 0xd45353,
-    };
     const planeMeshes = new Map<string, THREE.Mesh>();
-    for (const plane of getState().doc.planes) {
-      const geometry = new THREE.PlaneGeometry(PLANE_SIZE, PLANE_SIZE);
-      const material = new THREE.MeshBasicMaterial({
-        color: planeColors[plane.id] ?? 0x8aa0b8,
-        transparent: true,
-        opacity: 0.16,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      });
-      const mesh = new THREE.Mesh(geometry, material);
-      orientPlane(mesh, plane.id);
-      mesh.userData = { kind: "plane", id: plane.id };
-      planeGroup.add(mesh);
-      planeMeshes.set(plane.id, mesh);
-      const border = new THREE.LineSegments(
-        new THREE.EdgesGeometry(geometry),
-        new THREE.LineBasicMaterial({ color: planeColors[plane.id] ?? 0x8aa0b8 }),
-      );
-      border.raycast = () => undefined;
-      mesh.add(border);
-    }
 
     const bodies = new Map<string, { mesh: THREE.Mesh; edges: THREE.LineSegments }>();
     const previewMaterial = new THREE.MeshStandardMaterial({
@@ -224,6 +199,7 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
         syncPreview(currentState);
       }
       syncAppearance(currentState);
+      syncPlanes(currentState);
       syncHandles(currentState);
       syncSketch();
     };
@@ -339,6 +315,42 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
       disposeGroup(handleGroup);
       renderer.dispose();
     };
+
+    function syncPlanes(currentState: ReturnType<typeof getState>): void {
+      const alive = new Set(currentState.doc.planes.map((plane) => plane.id));
+      for (const [id, mesh] of planeMeshes) {
+        if (alive.has(id)) continue;
+        planeGroup.remove(mesh);
+        mesh.geometry.dispose();
+        (mesh.material as THREE.Material).dispose();
+        planeMeshes.delete(id);
+      }
+      for (const plane of currentState.doc.planes) {
+        let mesh = planeMeshes.get(plane.id);
+        if (!mesh) {
+          const geometry = new THREE.PlaneGeometry(PLANE_SIZE, PLANE_SIZE);
+          const color = planeColor(plane.id);
+          const material = new THREE.MeshBasicMaterial({
+            color,
+            transparent: true,
+            opacity: 0.16,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+          mesh = new THREE.Mesh(geometry, material);
+          mesh.userData = { kind: "plane", id: plane.id };
+          const border = new THREE.LineSegments(
+            new THREE.EdgesGeometry(geometry),
+            new THREE.LineBasicMaterial({ color }),
+          );
+          border.raycast = () => undefined;
+          mesh.add(border);
+          planeGroup.add(mesh);
+          planeMeshes.set(plane.id, mesh);
+        }
+        orientPlane(mesh, plane);
+      }
+    }
 
     function syncBodies(currentState: ReturnType<typeof getState>): void {
       const alive = new Set(Object.keys(currentState.meshes));
@@ -502,6 +514,13 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
       ), camera);
       const hits = raycaster.intersectObjects([...bodies.values()].map((visual) => visual.mesh).filter((mesh) => mesh.visible), false);
       const pointer = { x: event.clientX, y: event.clientY };
+      if (getState().edgePick) {
+        const edgeHit = closestEdgePoint();
+        if (edgeHit) {
+          void pickEdgeAt(edgeHit.bodyId, edgeHit.point);
+          return;
+        }
+      }
       if (hits[0]?.object.userData.kind === "body") {
         select({ kind: "body", id: String(hits[0].object.userData.id) }, pointer);
         return;
@@ -512,6 +531,30 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
         return;
       }
       select(null, null);
+    }
+
+    function closestEdgePoint(): { bodyId: string; point: Vec3 } | null {
+      const meshes = getState().meshes;
+      const bodiesInDoc = getState().doc.bodies;
+      let best: { bodyId: string; point: Vec3; distance: number } | null = null;
+      const threshold = camera.position.distanceTo(controls.target) * 0.02;
+      for (const body of bodiesInDoc) {
+        if (!body.visible) continue;
+        const edges = meshes[body.id]?.edges;
+        if (!edges) continue;
+        for (let index = 0; index < edges.length; index += 6) {
+          const start = new THREE.Vector3(edges[index], edges[index + 1], edges[index + 2]);
+          const end = new THREE.Vector3(edges[index + 3], edges[index + 4], edges[index + 5]);
+          const point = closestPointOnSegment(raycaster.ray, start, end);
+          if (!point) continue;
+          const distance = raycaster.ray.distanceToPoint(point);
+          if (distance > threshold) continue;
+          if (!best || distance < best.distance) {
+            best = { bodyId: body.id, point: { x: point.x, y: point.y, z: point.z }, distance };
+          }
+        }
+      }
+      return best ? { bodyId: best.bodyId, point: best.point } : null;
     }
 
     function highlightPlane(event: PointerEvent): void {
@@ -614,9 +657,33 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
   }
 }
 
-function orientPlane(mesh: THREE.Mesh, id: string): void {
-  if (id === "plane-xz") mesh.rotation.x = Math.PI / 2;
-  if (id === "plane-yz") mesh.rotation.y = -Math.PI / 2;
+function orientPlane(mesh: THREE.Mesh, plane: PlaneFrame): void {
+  const x = new THREE.Vector3(plane.xDir.x, plane.xDir.y, plane.xDir.z).normalize();
+  const z = new THREE.Vector3(plane.normal.x, plane.normal.y, plane.normal.z).normalize();
+  const y = new THREE.Vector3().crossVectors(z, x).normalize();
+  mesh.position.set(plane.origin.x, plane.origin.y, plane.origin.z);
+  mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+}
+
+function planeColor(id: string): number {
+  if (id === "plane-xy") return 0x2f9e6b;
+  if (id === "plane-xz") return 0x2f6fed;
+  if (id === "plane-yz") return 0xd45353;
+  return 0x7a5af8;
+}
+
+function closestPointOnSegment(ray: THREE.Ray, start: THREE.Vector3, end: THREE.Vector3): THREE.Vector3 | null {
+  const segment = end.clone().sub(start);
+  const lengthSq = segment.lengthSq();
+  if (lengthSq < 1e-8) return null;
+  const origin = start.clone().sub(ray.origin);
+  const dotRay = ray.direction.dot(segment);
+  const dotOrigin = ray.direction.dot(origin);
+  const denom = 1 - dotRay * dotRay / lengthSq;
+  let along = 0;
+  if (Math.abs(denom) > 1e-6) along = (dotOrigin * dotRay / lengthSq - origin.dot(segment) / lengthSq) / denom;
+  along = Math.max(0, Math.min(1, along));
+  return start.clone().addScaledVector(segment, along);
 }
 
 function isDrawTool(tool: string): boolean {

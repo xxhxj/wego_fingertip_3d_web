@@ -118,18 +118,41 @@ export function makeRevolvedShape(
   return solid;
 }
 
+export interface MeshOptions {
+  linearDeflection?: number;
+  angularDeflection?: number;
+  /** 只把法向最接近这个方向的面剖得更细。 */
+  face?: { direction: Vec3; linearDeflection: number } | null;
+}
+
 export function tessellateShape(
   kernel: OcctKernel,
   id: string,
   shape: ShapeHandle,
   quality: "preview" | "final",
+  meshOptions?: MeshOptions,
 ): BuiltMesh {
-  const deflection = quality === "preview"
-    ? { linearDeflection: 0.4, angularDeflection: 0.6 }
-    : { linearDeflection: 0.08, angularDeflection: 0.35 };
-  const mesh = kernel.meshShape(shape, deflection);
+  const deflection = {
+    linearDeflection: meshOptions?.linearDeflection ?? (quality === "preview" ? 0.4 : 0.08),
+    angularDeflection: meshOptions?.angularDeflection ?? (quality === "preview" ? 0.6 : 0.35),
+  };
+  let positions = copyFloat32([]);
+  let normals = copyFloat32([]);
+  let indices = copyUint32([]);
+  const refined = meshOptions?.face ? meshByFace(kernel, shape, deflection, meshOptions.face) : null;
+  if (refined) {
+    positions = refined.positions;
+    normals = refined.normals;
+    indices = refined.indices;
+  } else {
+    const mesh = kernel.meshShape(shape, deflection);
+    positions = copyFloat32(mesh.positions);
+    normals = copyFloat32(mesh.normals);
+    indices = copyUint32(mesh.indices);
+  }
   let edges = copyFloat32([]);
   try {
+    if (!kernel.hasTriangulation(shape)) kernel.meshShape(shape, deflection);
     const wire = kernel.wireframe(shape, { source: "triangulation", deflection: deflection.linearDeflection });
     edges = edgeSegments(wire.points, wire.edgeGroups, wire.edgeCount);
   } catch {
@@ -137,12 +160,70 @@ export function tessellateShape(
   }
   return {
     id,
-    positions: copyFloat32(mesh.positions),
-    normals: copyFloat32(mesh.normals),
-    indices: copyUint32(mesh.indices),
+    positions,
+    normals,
+    indices,
     edges,
     volume: measureVolume(kernel, shape),
   };
+}
+
+function meshByFace(
+  kernel: OcctKernel,
+  shape: ShapeHandle,
+  coarse: { linearDeflection: number; angularDeflection: number },
+  face: { direction: Vec3; linearDeflection: number },
+): { positions: Float32Array<ArrayBuffer>; normals: Float32Array<ArrayBuffer>; indices: Uint32Array<ArrayBuffer> } | null {
+  const faces = kernel.getSubShapes(shape, "face");
+  try {
+    if (faces.length === 0) return null;
+    const dir = normalize(face.direction);
+    let best = faces[0];
+    let bestDot = -2;
+    for (const item of faces) {
+      try {
+        const bounds = kernel.uvBounds(item);
+        const normal = kernel.surfaceNormal(item, (bounds.uMin + bounds.uMax) / 2, (bounds.vMin + bounds.vMax) / 2);
+        const score = normal.x * dir.x + normal.y * dir.y + normal.z * dir.z;
+        if (score > bestDot) {
+          bestDot = score;
+          best = item;
+        }
+      } catch {
+        // 读不到法向的面不参与比较。
+      }
+    }
+    const positionChunks: number[] = [];
+    const normalChunks: number[] = [];
+    const indexChunks: number[] = [];
+    let base = 0;
+    for (const item of faces) {
+      const options = item === best
+        ? { linearDeflection: face.linearDeflection, angularDeflection: coarse.angularDeflection }
+        : coarse;
+      const part = kernel.meshShape(item, options);
+      for (let index = 0; index < part.positions.length; index += 1) positionChunks.push(part.positions[index]);
+      for (let index = 0; index < part.normals.length; index += 1) normalChunks.push(part.normals[index]);
+      for (let index = 0; index < part.indices.length; index += 1) indexChunks.push(part.indices[index] + base);
+      base += part.vertexCount;
+    }
+    if (base === 0) return null;
+    return {
+      positions: copyFloat32(positionChunks),
+      normals: copyFloat32(normalChunks),
+      indices: copyUint32(indexChunks),
+    };
+  } catch {
+    return null;
+  } finally {
+    for (const item of faces) {
+      try {
+        kernel.release(item);
+      } catch {
+        // 句柄已经释放时忽略。
+      }
+    }
+  }
 }
 
 export function measureVolume(kernel: OcctKernel, shape: ShapeHandle): number {

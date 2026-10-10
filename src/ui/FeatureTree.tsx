@@ -1,5 +1,6 @@
 import { entityLabel } from "../model/profiles";
 import { featureSummary } from "../model/labels";
+import { planeSummary } from "../model/planes";
 import {
   beginExtrude,
   beginRevolve,
@@ -24,6 +25,7 @@ export function FeatureTree() {
           <button type="button" className="row-main" onClick={() => select({ kind: "plane", id: plane.id })}>
             <i className={`swatch plane-${plane.id}`} />
             {plane.name}
+            <small>{planeSummary(plane)}</small>
           </button>
           <button type="button" className="mini" onClick={() => startSketch(plane.id)}>草图</button>
         </div>

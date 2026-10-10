@@ -95,7 +95,8 @@ const tiny = buildExtrusion(kernel, {
 });
 assert(tiny.error === "拉伸距离太小", "零距离应被拒绝");
 
-const { replayModel } = await server.ssrLoadModule("/src/kernel/replay.ts");
+const { replayModel, exportStepModel, pickEdgeOnBody } = await server.ssrLoadModule("/src/kernel/replay.ts");
+const { resolveDocumentPlanes } = await server.ssrLoadModule("/src/model/planes.ts");
 const planes = [
   { id: "plane-xy", name: "XY", kind: "principal", origin: { x: 0, y: 0, z: 0 }, normal: { x: 0, y: 0, z: 1 }, xDir: { x: 1, y: 0, z: 0 } },
   { id: "plane-yz", name: "YZ", kind: "principal", origin: { x: 0, y: 0, z: 0 }, normal: { x: 1, y: 0, z: 0 }, xDir: { x: 0, y: 1, z: 0 } },
@@ -304,6 +305,114 @@ const drafted = play(
 );
 assert(!failed(drafted, "ed"), `拔模报错 ${failed(drafted, "ed")}`);
 near(meshOf(drafted, "bd").volume, 5962, "拔模体积");
+
+const fuzzy = play(
+  [
+    boxFeature("ea", "a", "ba"),
+    boxFeature("eb", "b", "bb"),
+    { id: "fuse", type: "boolean", name: "并集", operation: "fuse", targetBodyId: "ba", toolBodyId: "bb", fuzzy: 0.2 },
+  ],
+  [solidBody("ba", "ea"), solidBody("bb", "eb")],
+);
+assert(!failed(fuzzy, "fuse"), `缝合报错 ${failed(fuzzy, "fuse")}`);
+near(meshOf(fuzzy, "ba").volume, 12000, "带公差的并集");
+
+const cylinderSketch = [{
+  id: "sk",
+  name: "草图",
+  planeId: "plane-xy",
+  entities: [{ id: "c", type: "circle", center: { x: 0, y: 0 }, radius: 10 }],
+}];
+const coarse = play(
+  [boxFeature("ec", "c", "bc")],
+  [{ ...solidBody("bc", "ec"), deflection: 1.5 }],
+  cylinderSketch,
+);
+const fine = play(
+  [boxFeature("ec", "c", "bc")],
+  [{ ...solidBody("bc", "ec"), deflection: 1.5, faceDeflection: 0.03, faceDirection: { x: -1, y: 0, z: 0 } }],
+  cylinderSketch,
+);
+assert(meshOf(fine, "bc").indices.length > meshOf(coarse, "bc").indices.length, "单面加密应增加三角面");
+
+const stepSource = play([boxFeature("ea", "a", "ba")], [solidBody("ba", "ea")]);
+const stepText = exportStepModel(kernel, {
+  planes,
+  sketches: [{
+    id: "sk",
+    name: "草图",
+    planeId: "plane-xy",
+    entities: [
+      { id: "a", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 20, y: 20 } },
+      { id: "b", type: "rectangle", a: { x: 10, y: 0 }, b: { x: 30, y: 20 } },
+      { id: "ring", type: "rectangle", a: { x: 0, y: 10 }, b: { x: 20, y: 30 } },
+      { id: "wide", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 40, y: 25 } },
+      { id: "offset", type: "rectangle", a: { x: 30, y: 0 }, b: { x: 50, y: 20 } },
+    ],
+  }],
+  features: [boxFeature("ea", "a", "ba")],
+  bodies: [solidBody("ba", "ea")],
+  preview: null,
+}, "ba");
+assert(stepText.includes("ISO-10303-21"), "STEP 头");
+assert(meshOf(stepSource, "ba").volume > 0, "导出前实体存在");
+const imported = play(
+  [{ id: "step", type: "step", name: "导入", bodyId: "bs", step: stepText }],
+  [solidBody("bs", "step")],
+);
+assert(!failed(imported, "step"), `STEP 导入报错 ${failed(imported, "step")}`);
+near(meshOf(imported, "bs").volume, 8000, "STEP 往返体积");
+
+const edgeModel = {
+  planes,
+  sketches: [{
+    id: "sk",
+    name: "草图",
+    planeId: "plane-xy",
+    entities: [{ id: "a", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 20, y: 20 } }],
+  }],
+  features: [boxFeature("ea", "a", "ba")],
+  bodies: [solidBody("ba", "ea")],
+  preview: null,
+};
+const edge = pickEdgeOnBody(kernel, edgeModel, "ba", { x: 10, y: 0, z: 20 });
+const oneEdge = replayModel(kernel, {
+  ...edgeModel,
+  features: [
+    boxFeature("ea", "a", "ba"),
+    { id: "fillet", type: "fillet", name: "圆角", bodyId: "ba", radius: 2, edges: [edge] },
+  ],
+});
+assert(!failed(oneEdge, "fillet"), `选边圆角报错 ${failed(oneEdge, "fillet")}`);
+const oneEdgeVolume = meshOf(oneEdge, "ba").volume;
+const expectedEdge = 8000 - 20 * 4 * (1 - Math.PI / 4);
+assert(Math.abs(oneEdgeVolume - expectedEdge) < 8, `单边圆角 ${oneEdgeVolume} vs ${expectedEdge}`);
+
+const movedEdge = replayModel(kernel, {
+  ...edgeModel,
+  features: [
+    boxFeature("ea", "a", "ba"),
+    { id: "move", type: "move", name: "移动", bodyId: "ba", dx: 0, dy: 0, dz: 10, copy: false, newBodyId: null },
+    { id: "fillet", type: "fillet", name: "圆角", bodyId: "ba", radius: 2, edges: [{ ...edge, midpoint: { x: edge.midpoint.x, y: edge.midpoint.y, z: edge.midpoint.z + 10 } }] },
+  ],
+});
+assert(!failed(movedEdge, "fillet"), `移动后选边报错 ${failed(movedEdge, "fillet")}`);
+
+const planeDoc = {
+  planes: [
+    { id: "plane-xy", name: "XY", kind: "principal", sourceId: null, peerId: null, distance: 0, angleDeg: 0, origin: { x: 0, y: 0, z: 0 }, normal: { x: 0, y: 0, z: 1 }, xDir: { x: 1, y: 0, z: 0 } },
+    { id: "off", name: "偏置", kind: "offset", sourceId: "plane-xy", peerId: null, distance: 15, angleDeg: 0, origin: { x: 0, y: 0, z: 0 }, normal: { x: 0, y: 0, z: 1 }, xDir: { x: 1, y: 0, z: 0 } },
+    { id: "ang", name: "斜面", kind: "angled", sourceId: "plane-xy", peerId: null, distance: 0, angleDeg: 90, origin: { x: 0, y: 0, z: 0 }, normal: { x: 0, y: 0, z: 1 }, xDir: { x: 1, y: 0, z: 0 } },
+    { id: "mid", name: "等分", kind: "bisect", sourceId: "plane-xy", peerId: "off", distance: 0, angleDeg: 0, origin: { x: 0, y: 0, z: 0 }, normal: { x: 0, y: 0, z: 1 }, xDir: { x: 1, y: 0, z: 0 } },
+  ],
+  sketches: [],
+  features: [],
+  bodies: [],
+};
+resolveDocumentPlanes(planeDoc);
+assert(Math.abs(planeDoc.planes[1].origin.z - 15) < 1e-6, "偏置平面高度");
+assert(Math.abs(planeDoc.planes[2].normal.y + 1) < 1e-6, "斜面法向");
+assert(Math.abs(planeDoc.planes[3].origin.z - 7.5) < 1e-6, "等分平面高度");
 
 function maxAxis(positions, offset) {
   let value = -Infinity;

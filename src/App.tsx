@@ -5,6 +5,7 @@ import {
   cancelExtrude,
   cancelRevolve,
   cancelBoolean,
+  cancelEdgePick,
   closePolyline,
   confirmExtrude,
   confirmRevolve,
@@ -48,6 +49,7 @@ export function App() {
         if (current.extrudeDraft) cancelExtrude();
         else if (current.revolveDraft) cancelRevolve();
         else if (current.pendingBoolean) cancelBoolean();
+        else if (current.edgePick || current.pendingBisect) cancelEdgePick();
         else if (getGesture().draft) cancelDraft();
         else if (current.activeSketchId) finishSketch();
         else setTool("select");

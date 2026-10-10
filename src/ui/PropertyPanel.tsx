@@ -1,6 +1,8 @@
 import { entityLabel } from "../model/profiles";
 import type { Feature } from "../model/types";
 import {
+  beginEdgePick,
+  beginBisect,
   beginExtrude,
   beginRevolve,
   beginTransient,
@@ -9,10 +11,14 @@ import {
   confirmExtrude,
   confirmRevolve,
   continueSketch,
+  createAngledPlane,
+  createOffsetPlane,
   deleteSelection,
   editFeature,
+  editPlane,
   endTransient,
   setBodyColor,
+  setBodyMesh,
   setBodyVisible,
   setDraftDistances,
   setFeatureDistances,
@@ -107,6 +113,16 @@ export function PropertyPanel() {
         {body && editor.volumes[body.id] != null && <p className="metric">体积 {volumeFormat.format(editor.volumes[body.id])} mm³</p>}
         {body && (
           <>
+            <NumberField label="整体弦高 mm" value={body.deflection} onChange={(deflection) => setBodyMesh(body.id, { deflection })} />
+            <NumberField
+              label="单面弦高 mm，0 表示不单独加密"
+              value={body.faceDeflection ?? 0}
+              onChange={(faceDeflection) => setBodyMesh(body.id, {
+                faceDeflection: faceDeflection > 0 ? faceDeflection : null,
+                faceDirection: body.faceDirection ?? { x: 0, y: 0, z: 1 },
+              })}
+            />
+            <button type="button" onClick={beginEdgePick}>点选边倒圆</button>
             <label className="field">颜色
               <input
                 type="color"
@@ -132,8 +148,20 @@ export function PropertyPanel() {
     return (
       <section className="props">
         <h2>{plane?.name}</h2>
-        <p className="hint-copy">点选这个平面后可以直接在上面开草图。草图坐标的 u 轴沿平面 x 方向，v 轴由法向叉乘得到。镜像会用当前选中的平面。</p>
+        <p className="hint-copy">点选这个平面后可以直接在上面开草图。也可以沿法向偏置、绕 U 轴转成斜面，或再点一个平面做等分。</p>
         <button type="button" className="primary" onClick={() => plane && startSketch(plane.id)}>在此开草图</button>
+        <div className="button-row">
+          <button type="button" onClick={() => plane && createOffsetPlane(plane.id, plane.kind === "offset" ? plane.distance : 10)}>偏置</button>
+          <button type="button" onClick={() => plane && createAngledPlane(plane.id, plane.kind === "angled" ? plane.angleDeg : 30)}>斜面</button>
+          <button type="button" onClick={() => plane && beginBisect(plane.id)}>等分</button>
+        </div>
+        {plane && plane.kind === "offset" && (
+          <NumberField label="偏置距离 mm" value={plane.distance} onChange={(distance) => editPlane(plane.id, { distance })} />
+        )}
+        {plane && plane.kind === "angled" && (
+          <NumberField label="斜面角度 °" value={plane.angleDeg} onChange={(angleDeg) => editPlane(plane.id, { angleDeg })} />
+        )}
+        {plane && plane.kind !== "principal" && <button type="button" className="danger-button" onClick={deleteSelection}>删除平面</button>}
       </section>
     );
   }
@@ -212,7 +240,15 @@ function FeatureFields({ feature }: { feature: Feature }) {
     );
   }
   if (feature.type === "fillet") {
-    return <NumberField label="半径 mm" value={feature.radius} onChange={(radius) => editFeature(feature.id, (item) => { if (item.type === "fillet") item.radius = Math.max(0.05, radius); })} />;
+    return (
+      <>
+        <NumberField label="半径 mm" value={feature.radius} onChange={(radius) => editFeature(feature.id, (item) => { if (item.type === "fillet") item.radius = Math.max(0.05, radius); })} />
+        <p className="hint-copy">{feature.edges && feature.edges.length > 0 ? `已选择 ${feature.edges.length} 条边。` : "当前倒圆全部边。"}</p>
+        {feature.edges && feature.edges.length > 0 && (
+          <button type="button" onClick={() => editFeature(feature.id, (item) => { if (item.type === "fillet") item.edges = null; })}>改为全部边</button>
+        )}
+      </>
+    );
   }
   if (feature.type === "chamfer") {
     return <NumberField label="距离 mm" value={feature.distance} onChange={(distance) => editFeature(feature.id, (item) => { if (item.type === "chamfer") item.distance = Math.max(0.05, distance); })} />;
@@ -264,7 +300,19 @@ function FeatureFields({ feature }: { feature: Feature }) {
   }
   if (feature.type === "boolean") {
     const label = feature.operation === "fuse" ? "并集" : feature.operation === "cut" ? "差集" : "交集";
-    return <p className="hint-copy">这条{label}改写目标实体。删除它会回到运算前的形状，并重新显示工具体。</p>;
+    return (
+      <>
+        <p className="hint-copy">这条{label}改写目标实体。删除它会回到运算前的形状，并重新显示工具体。</p>
+        <NumberField
+          label="缝合公差 mm，0 为精确布尔"
+          value={feature.fuzzy}
+          onChange={(fuzzy) => editFeature(feature.id, (item) => { if (item.type === "boolean") item.fuzzy = Math.max(0, fuzzy); })}
+        />
+      </>
+    );
+  }
+  if (feature.type === "step") {
+    return <p className="hint-copy">STEP 原文保存在这条特征里，重放时重新读入。</p>;
   }
   return <p className="hint-copy">镜像副本。删除这条特征会去掉副本，源实体保留。</p>;
 }
@@ -286,8 +334,8 @@ function bodyFor(
   bodies: { id: string; featureId: string }[],
   feature: Feature | null,
   selection: { kind: string; id?: string } | null,
-): { id: string; featureId: string; color: string; visible: boolean } | undefined {
-  const list = bodies as { id: string; featureId: string; color: string; visible: boolean }[];
+): { id: string; featureId: string; color: string; visible: boolean; deflection: number; faceDeflection: number | null; faceDirection: { x: number; y: number; z: number } | null } | undefined {
+  const list = bodies as { id: string; featureId: string; color: string; visible: boolean; deflection: number; faceDeflection: number | null; faceDirection: { x: number; y: number; z: number } | null }[];
   if (selection?.kind === "body") return list.find((item) => item.id === selection.id);
   if (!feature) return undefined;
   if (feature.type === "boolean") return list.find((item) => item.id === feature.targetBodyId);
