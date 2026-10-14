@@ -35,6 +35,14 @@ export function featureSummary(feature: Feature): string {
       return `${feature.count} 个，间距 ${feature.spacing} mm`;
     case "circularPattern":
       return `${feature.count} 个，间隔 ${feature.angleDeg}°`;
+    case "sweep":
+      return "沿路径";
+    case "loft":
+      return `${feature.profiles.length} 个截面${feature.ruled ? " · 直纹" : ""}`;
+    case "push":
+      return `${feature.distance} mm`;
+    case "split":
+      return feature.keep === "both" ? "保留两侧" : feature.keep === "positive" ? "保留法向一侧" : "保留反法向一侧";
     default: {
       const unreachable: never = feature;
       return unreachable;

@@ -23,6 +23,13 @@ export interface EdgeRef {
   length: number;
 }
 
+export interface FaceRef {
+  /** 面上的一点，重建后用来找回同一个面。 */
+  midpoint: Vec3;
+  /** 该点处的单位法向。正的推拉距离沿这个方向加料。 */
+  normal: Vec3;
+}
+
 export interface DatumPlane extends PlaneFrame {
   id: string;
   name: string;
@@ -41,6 +48,8 @@ export type SketchEntity =
   | { id: string; type: "rectangle"; a: Vec2; b: Vec2 }
   | { id: string; type: "circle"; center: Vec2; radius: number }
   | { id: string; type: "polyline"; points: Vec2[]; closed: boolean }
+  | { id: string; type: "line"; a: Vec2; b: Vec2 }
+  | { id: string; type: "spline"; points: Vec2[] }
   | { id: string; type: "arc"; start: Vec2; mid: Vec2; end: Vec2 };
 
 export interface Sketch {
@@ -163,6 +172,53 @@ export interface CircularPatternFeature {
   count: number;
 }
 
+export interface SweepFeature {
+  id: string;
+  type: "sweep";
+  name: string;
+  profileSketchId: string;
+  profileEntityId: string;
+  pathSketchId: string;
+  pathEntityId: string;
+  bodyId: string;
+}
+
+export interface LoftProfile {
+  sketchId: string;
+  entityId: string;
+}
+
+export interface LoftFeature {
+  id: string;
+  type: "loft";
+  name: string;
+  profiles: LoftProfile[];
+  /** 为真时截面之间用直纹面连接。 */
+  ruled: boolean;
+  bodyId: string;
+}
+
+export interface PushFeature {
+  id: string;
+  type: "push";
+  name: string;
+  bodyId: string;
+  face: FaceRef;
+  /** 沿面法向的距离，单位 mm。负数向内减料。 */
+  distance: number;
+}
+
+export interface SplitFeature {
+  id: string;
+  type: "split";
+  name: string;
+  bodyId: string;
+  planeId: string;
+  keep: "both" | "positive" | "negative";
+  /** keep 为 both 时，反法向一侧放进这个新实体。 */
+  newBodyId: string | null;
+}
+
 export type Feature =
   | ExtrudeFeature
   | RevolveFeature
@@ -174,6 +230,10 @@ export type Feature =
   | MirrorFeature
   | LinearPatternFeature
   | CircularPatternFeature
+  | SweepFeature
+  | LoftFeature
+  | PushFeature
+  | SplitFeature
   | StepFeature;
 
 export interface StepFeature {
@@ -208,6 +268,8 @@ export type Draft =
   | { type: "rectangle"; a: Vec2; b: Vec2 }
   | { type: "circle"; center: Vec2; radius: number }
   | { type: "polyline"; points: Vec2[]; hover: Vec2 | null }
+  | { type: "line"; points: Vec2[]; hover: Vec2 | null }
+  | { type: "spline"; points: Vec2[]; hover: Vec2 | null }
   | { type: "arc"; points: Vec2[]; hover: Vec2 | null };
 
 export type Tool =
@@ -215,12 +277,18 @@ export type Tool =
   | "rectangle"
   | "circle"
   | "polyline"
+  | "line"
+  | "spline"
   | "arc"
   | "extrude"
   | "revolve"
+  | "sweep"
+  | "loft"
   | "fuse"
   | "cut"
   | "common"
+  | "push"
+  | "split"
   | "fillet"
   | "chamfer"
   | "shell"
@@ -228,7 +296,8 @@ export type Tool =
   | "copy"
   | "mirror"
   | "linear"
-  | "circular";
+  | "circular"
+  | "measure";
 
 export interface RevolveDraft {
   sketchId: string;
@@ -249,7 +318,17 @@ export type Selection =
   | { kind: "sketch"; id: string }
   | { kind: "entity"; sketchId: string; entityId: string }
   | { kind: "feature"; id: string }
-  | { kind: "body"; id: string };
+  | { kind: "body"; id: string }
+  | { kind: "face"; bodyId: string; face: FaceRef };
+
+export type PickFilter = "all" | "body" | "face" | "edge" | "sketch";
+
+export type ViewName = "iso" | "top" | "bottom" | "front" | "back" | "left" | "right";
+
+export interface MeasureHit {
+  point: Vec3;
+  direction: Vec3 | null;
+}
 
 export interface ExtrudeDraft {
   sketchId: string;

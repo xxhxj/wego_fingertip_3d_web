@@ -9,6 +9,7 @@ import {
   cancelExtrude,
   cancelRevolve,
   confirmExtrude,
+  confirmLoft,
   confirmRevolve,
   continueSketch,
   createAngledPlane,
@@ -23,6 +24,7 @@ import {
   setDraftDistances,
   setFeatureDistances,
   setRevolveDraft,
+  setSplitKeep,
   startSketch,
 } from "../state/editor";
 import { useEditor } from "../state/hooks";
@@ -86,6 +88,32 @@ export function PropertyPanel() {
           <button type="button" className="primary" onClick={confirmRevolve}>确认旋转</button>
           <button type="button" onClick={cancelRevolve}>取消</button>
         </div>
+      </section>
+    );
+  }
+
+  if (editor.tool === "sweep" && editor.pendingSweep) {
+    return (
+      <section className="props">
+        <h2>扫掠</h2>
+        <p className="hint-copy">截面已选定。在特征树里再点一条路径。路径可以不封闭，直线、样条和多段线都可以。</p>
+      </section>
+    );
+  }
+
+  if (editor.tool === "loft") {
+    return (
+      <section className="props">
+        <h2>放样</h2>
+        <p className="hint-copy">按点选顺序连接封闭截面。至少两个，然后按回车或点下面的按钮。</p>
+        <ol className="loft-list">
+          {editor.pendingLoft.map((profile, index) => {
+            const sketch = editor.doc.sketches.find((item) => item.id === profile.sketchId);
+            const entity = sketch?.entities.find((item) => item.id === profile.entityId);
+            return <li key={`${profile.entityId}-${index}`}>{sketch?.name ?? "草图"} · {entity ? entityLabel(entity) : "截面"}</li>;
+          })}
+        </ol>
+        <button type="button" className="primary" onClick={confirmLoft}>生成放样</button>
       </section>
     );
   }
@@ -311,10 +339,136 @@ function FeatureFields({ feature }: { feature: Feature }) {
       </>
     );
   }
+  if (feature.type === "sweep") {
+    return (
+      <>
+        <ProfileChoice
+          label="截面"
+          sketchId={feature.profileSketchId}
+          entityId={feature.profileEntityId}
+          onChange={(sketchId, entityId) => editFeature(feature.id, (item) => {
+            if (item.type !== "sweep") return;
+            item.profileSketchId = sketchId;
+            item.profileEntityId = entityId;
+          })}
+        />
+        <ProfileChoice
+          label="路径"
+          sketchId={feature.pathSketchId}
+          entityId={feature.pathEntityId}
+          onChange={(sketchId, entityId) => editFeature(feature.id, (item) => {
+            if (item.type !== "sweep") return;
+            item.pathSketchId = sketchId;
+            item.pathEntityId = entityId;
+          })}
+        />
+      </>
+    );
+  }
+  if (feature.type === "loft") {
+    return (
+      <>
+        {feature.profiles.map((profile, index) => (
+          <ProfileChoice
+            key={`${profile.entityId}-${index}`}
+            label={`截面 ${index + 1}`}
+            sketchId={profile.sketchId}
+            entityId={profile.entityId}
+            onChange={(sketchId, entityId) => editFeature(feature.id, (item) => {
+              if (item.type !== "loft") return;
+              const profiles = item.profiles.slice();
+              profiles[index] = { sketchId, entityId };
+              item.profiles = profiles;
+            })}
+          />
+        ))}
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={feature.ruled}
+            onChange={(event) => editFeature(feature.id, (item) => { if (item.type === "loft") item.ruled = event.target.checked; })}
+          />
+          直纹连接
+        </label>
+      </>
+    );
+  }
+  if (feature.type === "push") {
+    return (
+      <NumberField
+        label="距离 mm，正数沿法向"
+        value={feature.distance}
+        onChange={(distance) => editFeature(feature.id, (item) => {
+          if (item.type === "push") item.distance = Math.max(-2000, Math.min(2000, distance));
+        })}
+      />
+    );
+  }
+  if (feature.type === "split") {
+    return <SplitFields feature={feature} />;
+  }
   if (feature.type === "step") {
     return <p className="hint-copy">STEP 原文保存在这条特征里，重放时重新读入。</p>;
   }
   return <p className="hint-copy">镜像副本。删除这条特征会去掉副本，源实体保留。</p>;
+}
+
+function ProfileChoice({
+  label,
+  sketchId,
+  entityId,
+  onChange,
+}: {
+  label: string;
+  sketchId: string;
+  entityId: string;
+  onChange: (sketchId: string, entityId: string) => void;
+}) {
+  const editor = useEditor();
+  return (
+    <label className="field">{label}
+      <select
+        value={`${sketchId}:${entityId}`}
+        onChange={(event) => {
+          const [nextSketch, nextEntity] = event.target.value.split(":");
+          if (nextSketch && nextEntity) onChange(nextSketch, nextEntity);
+        }}
+      >
+        {editor.doc.sketches.flatMap((sketch) => sketch.entities.map((entity) => (
+          <option key={entity.id} value={`${sketch.id}:${entity.id}`}>{sketch.name} · {entityLabel(entity)}</option>
+        )))}
+      </select>
+    </label>
+  );
+}
+
+function SplitFields({ feature }: { feature: Extract<Feature, { type: "split" }> }) {
+  const editor = useEditor();
+  return (
+    <>
+      <label className="field">分割平面
+        <select
+          value={feature.planeId}
+          onChange={(event) => editFeature(feature.id, (item) => { if (item.type === "split") item.planeId = event.target.value; })}
+        >
+          {editor.doc.planes.map((plane) => <option key={plane.id} value={plane.id}>{plane.name}</option>)}
+        </select>
+      </label>
+      <label className="field">保留
+        <select
+          value={feature.keep}
+          onChange={(event) => {
+            const keep = event.target.value === "positive" || event.target.value === "negative" ? event.target.value : "both";
+            setSplitKeep(feature.id, keep);
+          }}
+        >
+          <option value="both">两侧都留</option>
+          <option value="positive">法向一侧</option>
+          <option value="negative">反法向一侧</option>
+        </select>
+      </label>
+    </>
+  );
 }
 
 function selectedFeature(

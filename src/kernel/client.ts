@@ -1,6 +1,6 @@
 import type { BuildResult } from "./build";
 import type { ReplayRequest } from "./protocol";
-import type { EdgeRef, Vec3 } from "../model/types";
+import type { EdgeRef, FaceRef, Vec3 } from "../model/types";
 
 let worker: Worker | null = null;
 let ready: Promise<void> | null = null;
@@ -43,6 +43,10 @@ export function exportStep(model: ReplayRequest, bodyId: string | null): Promise
 
 export function pickEdge(model: ReplayRequest, bodyId: string, point: Vec3): Promise<EdgeRef> {
   return request<EdgeRef>("pick-edge", { model, bodyId, point }, (data) => data.edge as EdgeRef);
+}
+
+export function pickFace(model: ReplayRequest, bodyId: string, point: Vec3): Promise<FaceRef> {
+  return request<FaceRef>("pick-face", { model, bodyId, point }, (data) => data.face as FaceRef);
 }
 
 function request<T>(type: string, payload: Record<string, unknown>, read: (data: Record<string, unknown>) => T): Promise<T> {

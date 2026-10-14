@@ -1,7 +1,7 @@
 import { BooleanOp, JoinType, type OcctKernel, type ShapeHandle } from "occt-wasm";
 import { normalize } from "../model/math";
-import type { EdgeRef, Feature, PlaneFrame, SketchEntity, Vec3 } from "../model/types";
-import { makeExtrudedShape, makeRevolvedShape, tessellateShape, type BuildResult, type MeshOptions } from "./build";
+import type { EdgeRef, FaceRef, Feature, PlaneFrame, SketchEntity, Vec3 } from "../model/types";
+import { makeExtrudedShape, makeLoftShape, makeRevolvedShape, makeSweepShape, measureVolume, tessellateShape, type BuildResult, type MeshOptions } from "./build";
 import type { ReplayPreview, ReplayRequest } from "./protocol";
 
 /**
@@ -142,6 +142,28 @@ function applyFeature(
     const mirrored = kernel.mirror(copied, plane.origin, normalize(plane.normal));
     created.push(mirrored);
     shapes.set(feature.newBodyId, mirrored);
+    return;
+  }
+  if (feature.type === "sweep") {
+    const profile = locate(request, feature.profileSketchId, feature.profileEntityId);
+    const path = locate(request, feature.pathSketchId, feature.pathEntityId);
+    const solid = makeSweepShape(kernel, profile.plane, profile.entity, path.plane, path.entity, created);
+    shapes.set(feature.bodyId, solid);
+    return;
+  }
+  if (feature.type === "loft") {
+    const profiles = feature.profiles.map((profile) => locate(request, profile.sketchId, profile.entityId));
+    const solid = makeLoftShape(kernel, profiles, feature.ruled, created);
+    shapes.set(feature.bodyId, solid);
+    return;
+  }
+  if (feature.type === "push") {
+    const result = pushFace(kernel, requireShape(shapes, feature.bodyId), feature.face, feature.distance, created);
+    shapes.set(feature.bodyId, result);
+    return;
+  }
+  if (feature.type === "split") {
+    splitBody(kernel, request, feature, shapes, created);
     return;
   }
   if (feature.type === "linearPattern") {
@@ -330,6 +352,121 @@ export function exportStepModel(kernel: OcctKernel, request: ReplayRequest, body
     const compound = kernel.makeCompound(chosen);
     created.push(compound);
     return kernel.exportStep(compound);
+  } finally {
+    releaseAll(kernel, created);
+  }
+}
+
+function pushFace(
+  kernel: OcctKernel,
+  shape: ShapeHandle,
+  faceRef: FaceRef,
+  distance: number,
+  created: ShapeHandle[],
+): ShapeHandle {
+  if (!(Math.abs(distance) > 0.05)) throw new Error("推拉距离太小");
+  const solid = primarySolid(kernel, shape, created);
+  const face = matchFace(kernel, solid, faceRef, created);
+  const normal = normalize(faceRef.normal);
+  const prism = kernel.extrude(face, normal.x * distance, normal.y * distance, normal.z * distance);
+  created.push(prism);
+  const result = distance > 0 ? kernel.fuse(solid, prism) : kernel.cut(solid, prism);
+  created.push(result);
+  return result;
+}
+
+function splitBody(
+  kernel: OcctKernel,
+  request: ReplayRequest,
+  feature: Extract<Feature, { type: "split" }>,
+  shapes: Map<string, ShapeHandle>,
+  created: ShapeHandle[],
+): void {
+  const plane = request.planes.find((item) => item.id === feature.planeId);
+  if (!plane) throw new Error("分割平面不存在");
+  const solid = primarySolid(kernel, requireShape(shapes, feature.bodyId), created);
+  const normal = normalize(plane.normal);
+  const positiveTool = kernel.halfSpace(plane.origin, normal);
+  const negativeTool = kernel.halfSpace(plane.origin, { x: -normal.x, y: -normal.y, z: -normal.z });
+  created.push(positiveTool, negativeTool);
+  const positive = kernel.common(solid, positiveTool);
+  const negative = kernel.common(solid, negativeTool);
+  created.push(positive, negative);
+  const positiveVolume = measureVolume(kernel, positive);
+  const negativeVolume = measureVolume(kernel, negative);
+  if (feature.keep === "both" && (positiveVolume < 1e-3 || negativeVolume < 1e-3)) throw new Error("平面没有切开实体");
+  if (feature.keep === "positive") {
+    if (positiveVolume < 1e-3) throw new Error("法向一侧没有实体");
+    shapes.set(feature.bodyId, positive);
+    return;
+  }
+  if (feature.keep === "negative") {
+    if (negativeVolume < 1e-3) throw new Error("反法向一侧没有实体");
+    shapes.set(feature.bodyId, negative);
+    return;
+  }
+  if (!feature.newBodyId) throw new Error("分割没有另一侧实体");
+  shapes.set(feature.bodyId, positive);
+  shapes.set(feature.newBodyId, negative);
+}
+
+function matchFace(kernel: OcctKernel, solid: ShapeHandle, faceRef: FaceRef, created: ShapeHandle[]): ShapeHandle {
+  const faces = take(kernel, solid, "face", created);
+  const dir = normalize(faceRef.normal);
+  let best = faces[0];
+  let bestScore = Infinity;
+  for (const face of faces) {
+    let center = faceRef.midpoint;
+    try {
+      center = kernel.getCenterOfMass(face);
+    } catch {
+      center = faceRef.midpoint;
+    }
+    const distance = Math.hypot(center.x - faceRef.midpoint.x, center.y - faceRef.midpoint.y, center.z - faceRef.midpoint.z);
+    let align = 1;
+    try {
+      const bounds = kernel.uvBounds(face);
+      const normal = kernel.surfaceNormal(face, (bounds.uMin + bounds.uMax) / 2, (bounds.vMin + bounds.vMax) / 2);
+      align = 1 - (normal.x * dir.x + normal.y * dir.y + normal.z * dir.z);
+    } catch {
+      align = 1;
+    }
+    const score = distance + Math.max(0, align) * 25;
+    if (score < bestScore) {
+      bestScore = score;
+      best = face;
+    }
+  }
+  if (!best || bestScore > 40) throw new Error("找不到对应的面");
+  return best;
+}
+
+export function pickFaceOnBody(kernel: OcctKernel, request: ReplayRequest, bodyId: string, point: Vec3): FaceRef {
+  const created: ShapeHandle[] = [];
+  try {
+    const { shapes } = buildShapeMap(kernel, request, created);
+    const shape = shapes.get(bodyId);
+    if (!shape) throw new Error("目标实体还没有生成");
+    const solid = primarySolid(kernel, shape, created);
+    const faces = take(kernel, solid, "face", created);
+    let best: FaceRef | null = null;
+    let bestDistance = Infinity;
+    for (const face of faces) {
+      let projected: Vec3;
+      try {
+        projected = kernel.projectPointOnFace(face, point);
+      } catch {
+        continue;
+      }
+      const distance = Math.hypot(projected.x - point.x, projected.y - point.y, projected.z - point.z);
+      if (distance >= bestDistance) continue;
+      const bounds = kernel.uvBounds(face);
+      const normal = kernel.surfaceNormal(face, (bounds.uMin + bounds.uMax) / 2, (bounds.vMin + bounds.vMax) / 2);
+      bestDistance = distance;
+      best = { midpoint: kernel.getCenterOfMass(face), normal: normalize(normal) };
+    }
+    if (!best || bestDistance > 5) throw new Error("没有点到面");
+    return best;
   } finally {
     releaseAll(kernel, created);
   }

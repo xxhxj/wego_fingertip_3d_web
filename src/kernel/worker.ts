@@ -2,8 +2,8 @@ import wasmUrl from "occt-wasm/dist/occt-wasm.wasm?url";
 import { OcctKernel } from "occt-wasm";
 import type { BuildResult } from "./build";
 import type { ReplayRequest } from "./protocol";
-import { exportStepModel, pickEdgeOnBody, replayModel } from "./replay";
-import type { EdgeRef, Vec3 } from "../model/types";
+import { exportStepModel, pickEdgeOnBody, pickFaceOnBody, replayModel } from "./replay";
+import type { EdgeRef, FaceRef, Vec3 } from "../model/types";
 
 let kernelPromise: Promise<OcctKernel> | null = null;
 
@@ -49,7 +49,7 @@ self.onmessage = (event: MessageEvent<{
       });
     return;
   }
-  if ((message.type === "export-step" || message.type === "pick-edge") && message.id != null && message.model) {
+  if ((message.type === "export-step" || message.type === "pick-edge" || message.type === "pick-face") && message.id != null && message.model) {
     const requestId = message.id;
     const model = message.model;
     const kind = message.type;
@@ -58,6 +58,11 @@ self.onmessage = (event: MessageEvent<{
         if (kind === "export-step") {
           const step = exportStepModel(kernel, model, message.bodyId ?? null);
           post({ type: "export-step", id: requestId, step });
+          return;
+        }
+        if (kind === "pick-face") {
+          const face: FaceRef = pickFaceOnBody(kernel, model, message.bodyId ?? "", message.point ?? { x: 0, y: 0, z: 0 });
+          post({ type: "pick-face", id: requestId, face });
           return;
         }
         const edge: EdgeRef = pickEdgeOnBody(kernel, model, message.bodyId ?? "", message.point ?? { x: 0, y: 0, z: 0 });

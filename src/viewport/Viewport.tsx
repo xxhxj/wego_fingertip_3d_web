@@ -1,12 +1,16 @@
 import { useEffect, useRef } from "react";
-import { finishSketch } from "../state/editor";
+import { finishSketch, setView, toggleSection } from "../state/editor";
 import { useEditor } from "../state/hooks";
-import { getViewport, mountViewport, type ViewName } from "./engine";
+import { getViewport, mountViewport } from "./engine";
+import type { ViewName } from "../model/types";
 
-const VIEWS: { id: ViewName; label: string }[] = [
+const CUBE: { id: ViewName; label: string }[] = [
+  { id: "top", label: "上" },
+  { id: "left", label: "左" },
   { id: "front", label: "前" },
-  { id: "top", label: "顶" },
   { id: "right", label: "右" },
+  { id: "bottom", label: "下" },
+  { id: "back", label: "后" },
   { id: "iso", label: "轴测" },
 ];
 
@@ -26,11 +30,23 @@ export function Viewport() {
   return (
     <div className="viewport">
       <canvas ref={canvasRef} />
-      <div className="view-actions">
-        {VIEWS.map((view) => (
-          <button key={view.id} type="button" onClick={() => getViewport()?.look(view.id)}>{view.label}</button>
+      <div className="view-cube" data-current={editor.viewName}>
+        {CUBE.map((view) => (
+          <button
+            key={view.id}
+            type="button"
+            data-view={view.id}
+            className={editor.viewName === view.id ? "active" : undefined}
+            onClick={() => setView(view.id)}
+          >
+            {view.label}
+          </button>
         ))}
+        <button type="button" data-section={editor.sectionPlaneId ? "on" : "off"} onClick={() => toggleSection()}>
+          {editor.sectionPlaneId ? "关闭剖视" : "剖视"}
+        </button>
       </div>
+      {editor.tool === "measure" && <div className="measure-readout">{editor.status}</div>}
       <p className="legend">XY 绿 · XZ 蓝 · YZ 红 · 轴：X 红 Y 绿 Z 蓝</p>
       {sketch && (
         <div className="sketch-banner">

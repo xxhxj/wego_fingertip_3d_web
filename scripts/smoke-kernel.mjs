@@ -414,6 +414,96 @@ assert(Math.abs(planeDoc.planes[1].origin.z - 15) < 1e-6, "偏置平面高度");
 assert(Math.abs(planeDoc.planes[2].normal.y + 1) < 1e-6, "斜面法向");
 assert(Math.abs(planeDoc.planes[3].origin.z - 7.5) < 1e-6, "等分平面高度");
 
+const sweep = replayModel(kernel, {
+  planes,
+  sketches: [
+    { id: "prof", name: "截面", planeId: "plane-yz", entities: [{ id: "sec", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 10, y: 10 } }] },
+    { id: "path", name: "路径", planeId: "plane-xy", entities: [{ id: "spine", type: "line", a: { x: 0, y: 0 }, b: { x: 20, y: 0 } }] },
+    { id: "curve", name: "样条", planeId: "plane-xy", entities: [{ id: "spl", type: "spline", points: [{ x: 0, y: 0 }, { x: 10, y: 2 }, { x: 20, y: 0 }] }] },
+  ],
+  features: [{ id: "sw", type: "sweep", name: "扫掠", profileSketchId: "prof", profileEntityId: "sec", pathSketchId: "path", pathEntityId: "spine", bodyId: "sw" }],
+  bodies: [solidBody("sw", "sw")],
+  preview: null,
+});
+assert(!failed(sweep, "sw"), `扫掠报错 ${failed(sweep, "sw")}`);
+const sweepVolume = meshOf(sweep, "sw").volume;
+assert(sweepVolume > 0, "扫掠体积");
+const sweepAgain = replayModel(kernel, {
+  planes,
+  sketches: [
+    { id: "prof", name: "截面", planeId: "plane-yz", entities: [{ id: "sec", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 10, y: 10 } }] },
+    { id: "path", name: "路径", planeId: "plane-xy", entities: [{ id: "spine", type: "line", a: { x: 0, y: 0 }, b: { x: 20, y: 0 } }] },
+  ],
+  features: [{ id: "sw", type: "sweep", name: "扫掠", profileSketchId: "prof", profileEntityId: "sec", pathSketchId: "path", pathEntityId: "spine", bodyId: "sw" }],
+  bodies: [solidBody("sw", "sw")],
+  preview: null,
+});
+assert(Math.abs(meshOf(sweepAgain, "sw").volume - sweepVolume) < 1e-4, "扫掠体积不稳定");
+const splineSweep = replayModel(kernel, {
+  planes,
+  sketches: [
+    { id: "prof", name: "截面", planeId: "plane-yz", entities: [{ id: "sec", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 10, y: 10 } }] },
+    { id: "curve", name: "样条", planeId: "plane-xy", entities: [{ id: "spl", type: "spline", points: [{ x: 0, y: 0 }, { x: 10, y: 2 }, { x: 20, y: 0 }] }] },
+  ],
+  features: [{ id: "ss", type: "sweep", name: "样条扫掠", profileSketchId: "prof", profileEntityId: "sec", pathSketchId: "curve", pathEntityId: "spl", bodyId: "ss" }],
+  bodies: [solidBody("ss", "ss")],
+  preview: null,
+});
+assert(!failed(splineSweep, "ss") && meshOf(splineSweep, "ss").volume > 0, `样条扫掠失败 ${failed(splineSweep, "ss")}`);
+
+const loftPlanes = [
+  ...planes,
+  { id: "high", name: "高", kind: "offset", origin: { x: 0, y: 0, z: 20 }, normal: { x: 0, y: 0, z: 1 }, xDir: { x: 1, y: 0, z: 0 } },
+];
+const loftRequest = {
+  planes: loftPlanes,
+  sketches: [
+    { id: "bottom", name: "下", planeId: "plane-xy", entities: [{ id: "big", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 10, y: 10 } }] },
+    { id: "top", name: "上", planeId: "high", entities: [{ id: "small", type: "rectangle", a: { x: 2, y: 2 }, b: { x: 8, y: 8 } }] },
+  ],
+  features: [{
+    id: "loft",
+    type: "loft",
+    name: "放样",
+    profiles: [{ sketchId: "bottom", entityId: "big" }, { sketchId: "top", entityId: "small" }],
+    ruled: true,
+    bodyId: "loft",
+  }],
+  bodies: [solidBody("loft", "loft")],
+  preview: null,
+};
+const loft = replayModel(kernel, loftRequest);
+assert(!failed(loft, "loft"), `放样报错 ${failed(loft, "loft")}`);
+const loftVolume = meshOf(loft, "loft").volume;
+assert(loftVolume > 0, "放样体积");
+const loftAgain = replayModel(kernel, loftRequest);
+assert(Math.abs(meshOf(loftAgain, "loft").volume - loftVolume) < 1e-4, "放样体积不稳定");
+
+const pushed = play([
+  boxFeature("ea", "a", "ba"),
+  { id: "push", type: "push", name: "推拉", bodyId: "ba", distance: 5, face: { midpoint: { x: 10, y: 10, z: 20 }, normal: { x: 0, y: 0, z: 1 } } },
+], [solidBody("ba", "ea")]);
+assert(!failed(pushed, "push"), `推拉报错 ${failed(pushed, "push")}`);
+near(meshOf(pushed, "ba").volume, 10000, "推拉后面体积");
+
+const splitPlanes = [
+  ...planes,
+  { id: "cut", name: "切割", kind: "offset", origin: { x: 0, y: 0, z: 8 }, normal: { x: 0, y: 0, z: 1 }, xDir: { x: 1, y: 0, z: 0 } },
+];
+const split = replayModel(kernel, {
+  planes: splitPlanes,
+  sketches: [{ id: "sk", name: "草图", planeId: "plane-xy", entities: [{ id: "a", type: "rectangle", a: { x: 0, y: 0 }, b: { x: 20, y: 20 } }] }],
+  features: [
+    boxFeature("ea", "a", "ba"),
+    { id: "split", type: "split", name: "分割", bodyId: "ba", planeId: "cut", keep: "both", newBodyId: "bb" },
+  ],
+  bodies: [solidBody("ba", "ea"), solidBody("bb", "split")],
+  preview: null,
+});
+assert(!failed(split, "split"), `分割报错 ${failed(split, "split")}`);
+const splitSum = meshOf(split, "ba").volume + meshOf(split, "bb").volume;
+near(splitSum, 8000, "分割两侧体积之和");
+
 function maxAxis(positions, offset) {
   let value = -Infinity;
   for (let index = offset; index < positions.length; index += 3) value = Math.max(value, positions[index]);

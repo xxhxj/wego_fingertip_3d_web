@@ -5,10 +5,11 @@ import {
   cancelExtrude,
   cancelRevolve,
   cancelBoolean,
-  cancelEdgePick,
   closePolyline,
   confirmExtrude,
+  confirmLoft,
   confirmRevolve,
+  finishSpline,
   deleteSelection,
   finishSketch,
   getState,
@@ -49,7 +50,7 @@ export function App() {
         if (current.extrudeDraft) cancelExtrude();
         else if (current.revolveDraft) cancelRevolve();
         else if (current.pendingBoolean) cancelBoolean();
-        else if (current.edgePick || current.pendingBisect) cancelEdgePick();
+        else if (current.edgePick || current.pendingBisect || current.pendingSweep || current.pendingLoft.length > 0 || current.tool === "measure") setTool("select");
         else if (getGesture().draft) cancelDraft();
         else if (current.activeSketchId) finishSketch();
         else setTool("select");
@@ -57,6 +58,8 @@ export function App() {
       }
       if (event.key === "Enter") {
         if (getState().tool === "polyline") closePolyline();
+        else if (getState().tool === "spline") finishSpline();
+        else if (getState().tool === "loft") confirmLoft();
         else if (getState().extrudeDraft) confirmExtrude();
         else if (getState().revolveDraft) confirmRevolve();
         return;

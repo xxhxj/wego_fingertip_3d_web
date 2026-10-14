@@ -6,6 +6,7 @@ export function isClosed(entity: SketchEntity): boolean {
   }
   if (entity.type === "circle") return entity.radius > 0.2;
   if (entity.type === "polyline") return entity.closed && entity.points.length >= 3;
+  if (entity.type === "line" || entity.type === "spline") return false;
   return separated(entity.start, entity.mid) && separated(entity.mid, entity.end) && separated(entity.start, entity.end);
 }
 
@@ -17,6 +18,8 @@ export function entityLabel(entity: SketchEntity): string {
   }
   if (entity.type === "circle") return `圆 R${entity.radius.toFixed(1)}`;
   if (entity.type === "polyline") return `多段线 ${entity.points.length} 点`;
+  if (entity.type === "line") return "直线";
+  if (entity.type === "spline") return `样条 ${entity.points.length} 点`;
   return "圆弧";
 }
 
@@ -48,6 +51,8 @@ export function sampleEntity(entity: SketchEntity): Sample {
   if (entity.type === "rectangle") return { points: rectangleCorners(entity.a, entity.b), closed: true };
   if (entity.type === "circle") return { points: circlePoints(entity.center, entity.radius, 64), closed: true };
   if (entity.type === "polyline") return { points: entity.points, closed: entity.closed };
+  if (entity.type === "line") return { points: [entity.a, entity.b], closed: false };
+  if (entity.type === "spline") return { points: sampleSpline(entity.points), closed: false };
   return { points: sampleArc(entity.start, entity.mid, entity.end), closed: true };
 }
 
@@ -57,13 +62,44 @@ export function sampleDraft(draft: Draft): Sample {
     if (draft.radius < 0.05) return { points: [draft.center], closed: false };
     return { points: circlePoints(draft.center, draft.radius, 64), closed: true };
   }
-  if (draft.type === "polyline") {
+  if (draft.type === "polyline" || draft.type === "line") {
     const points = draft.hover ? [...draft.points, draft.hover] : draft.points;
     return { points, closed: false };
+  }
+  if (draft.type === "spline") {
+    const points = draft.hover ? [...draft.points, draft.hover] : draft.points;
+    return { points: points.length >= 3 ? sampleSpline(points) : points, closed: false };
   }
   const points = draft.hover ? [...draft.points, draft.hover] : draft.points;
   if (points.length >= 3) return { points: sampleArc(points[0], points[1], points[2]), closed: true };
   return { points, closed: false };
+}
+
+function sampleSpline(points: Vec2[]): Vec2[] {
+  if (points.length < 3) return points;
+  const samples: Vec2[] = [];
+  const steps = 8;
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const p0 = points[Math.max(0, index - 1)];
+    const p1 = points[index];
+    const p2 = points[index + 1];
+    const p3 = points[Math.min(points.length - 1, index + 2)];
+    for (let step = 0; step < steps; step += 1) {
+      const t = step / steps;
+      samples.push(catmull(p0, p1, p2, p3, t));
+    }
+  }
+  samples.push(points[points.length - 1]);
+  return samples;
+}
+
+function catmull(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: number): Vec2 {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return {
+    x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+    y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3),
+  };
 }
 
 function circlePoints(center: Vec2, radius: number, count: number): Vec2[] {

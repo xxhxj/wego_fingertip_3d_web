@@ -1,20 +1,26 @@
-import { replay, initKernel, exportStep, pickEdge } from "../kernel/client";
+import { replay, initKernel, exportStep, pickEdge, pickFace } from "../kernel/client";
 import { isBuiltMesh, type BuildResult } from "../kernel/build";
 import type { ReplayRequest } from "../kernel/protocol";
 import { BODY_COLORS, cloneDoc, createDocument, uid } from "../model/document";
 import { resolveDocumentPlanes } from "../model/planes";
+import { dot, lengthOf, normalize, sub } from "../model/math";
 import { entityLabel, isClosed } from "../model/profiles";
 import type {
   DocumentModel,
   EdgeRef,
   ExtrudeDraft,
+  FaceRef,
   Feature,
+  MeasureHit,
   PendingBoolean,
+  PickFilter,
   RevolveDraft,
   Selection,
   SketchEntity,
   Tool,
   Vec2,
+  Vec3,
+  ViewName,
 } from "../model/types";
 import { getGesture, setGesture } from "./gesture";
 
@@ -41,7 +47,13 @@ export interface EditorState {
   revolveDraft: RevolveDraft | null;
   pendingBoolean: PendingBoolean | null;
   pendingBisect: string | null;
+  pendingSweep: { sketchId: string; entityId: string } | null;
+  pendingLoft: { sketchId: string; entityId: string }[];
   edgePick: boolean;
+  pickFilter: PickFilter;
+  viewName: ViewName;
+  sectionPlaneId: string | null;
+  measureHits: MeasureHit[];
   status: string;
   kernel: "loading" | "ready" | "error";
   kernelMessage: string;
@@ -68,7 +80,13 @@ let state: EditorState = {
   revolveDraft: null,
   pendingBoolean: null,
   pendingBisect: null,
+  pendingSweep: null,
+  pendingLoft: [],
   edgePick: false,
+  pickFilter: "all",
+  viewName: "iso",
+  sectionPlaneId: null,
+  measureHits: [],
   status: "选择一个基准面，然后开始草图。",
   kernel: "loading",
   kernelMessage: "正在加载 Open CASCADE…",
@@ -269,7 +287,7 @@ function sanitize(current: EditorState): EditorState {
   let pendingBoolean = current.pendingBoolean;
   if (pendingBoolean && !current.doc.bodies.some((body) => body.id === pendingBoolean?.targetBodyId)) pendingBoolean = null;
   let tool = current.tool;
-  const drawing = tool === "rectangle" || tool === "circle" || tool === "polyline" || tool === "arc";
+  const drawing = tool === "rectangle" || tool === "circle" || tool === "polyline" || tool === "line" || tool === "spline" || tool === "arc";
   if ((drawing && !activeSketchId) || (tool === "extrude" && !extrudeDraft) || (tool === "revolve" && !revolveDraft)) tool = "select";
   if ((tool === "fuse" || tool === "cut" || tool === "common") && !pendingBoolean) tool = "select";
   return { ...current, activeSketchId, selection, extrudeDraft, revolveDraft, pendingBoolean, tool };
@@ -281,6 +299,8 @@ function validSelection(document: DocumentModel, selection: Selection | null): S
   if (selection.kind === "sketch") return document.sketches.some((sketch) => sketch.id === selection.id) ? selection : null;
   if (selection.kind === "feature") return document.features.some((feature) => feature.id === selection.id) ? selection : null;
   if (selection.kind === "body") return document.bodies.some((body) => body.id === selection.id) ? selection : null;
+  if (selection.kind === "face") return document.bodies.some((body) => body.id === selection.bodyId) ? selection : null;
+  if (selection.kind !== "entity") return null;
   const sketch = document.sketches.find((item) => item.id === selection.sketchId);
   const entity = sketch?.entities.find((item) => item.id === selection.entityId);
   return sketch && entity ? selection : null;
@@ -334,6 +354,18 @@ export function select(selection: Selection | null, pointer: { x: number; y: num
     createBisect(state.pendingBisect, selection.id);
     return;
   }
+  if (state.pendingSweep && selection?.kind === "entity") {
+    const same = selection.sketchId === state.pendingSweep.sketchId && selection.entityId === state.pendingSweep.entityId;
+    if (!same) {
+      confirmSweep(state.pendingSweep, { sketchId: selection.sketchId, entityId: selection.entityId });
+      return;
+    }
+  }
+  if (state.tool === "loft" && selection?.kind === "entity") {
+    addLoftProfile({ sketchId: selection.sketchId, entityId: selection.entityId });
+    update({ selection, pointer });
+    return;
+  }
   update({
     selection,
     pointer,
@@ -369,7 +401,27 @@ export function setTool(tool: Tool): void {
     applyBodyTool(tool);
     return;
   }
-  const drawing = tool === "rectangle" || tool === "circle" || tool === "polyline" || tool === "arc";
+  if (tool === "sweep") {
+    beginSweep();
+    return;
+  }
+  if (tool === "loft") {
+    beginLoft();
+    return;
+  }
+  if (tool === "push") {
+    beginPush();
+    return;
+  }
+  if (tool === "split") {
+    beginSplit();
+    return;
+  }
+  if (tool === "measure") {
+    beginMeasure();
+    return;
+  }
+  const drawing = tool === "rectangle" || tool === "circle" || tool === "polyline" || tool === "line" || tool === "spline" || tool === "arc";
   if (drawing && !state.activeSketchId) {
     const selection = state.selection;
     let planeId = "plane-xy";
@@ -383,7 +435,17 @@ export function setTool(tool: Tool): void {
     return;
   }
   const hadPreview = state.extrudeDraft != null || state.revolveDraft != null;
-  update({ tool, extrudeDraft: null, revolveDraft: null, pendingBoolean: null, pendingBisect: null, edgePick: false });
+  update({
+    tool,
+    extrudeDraft: null,
+    revolveDraft: null,
+    pendingBoolean: null,
+    pendingBisect: null,
+    pendingSweep: null,
+    pendingLoft: [],
+    edgePick: false,
+    measureHits: [],
+  });
   setGesture({ draft: null, readout: "" });
   if (hadPreview) scheduleReplay();
 }
@@ -468,6 +530,10 @@ export function drawingMove(point: Vec2): void {
     setGesture({ draft: { ...draft, radius }, readout: `圆 R${radius.toFixed(1)} mm` });
   } else if (draft.type === "polyline") {
     setGesture({ draft: { ...draft, hover: point }, readout: `多段线 ${draft.points.length} 点` });
+  } else if (draft.type === "line") {
+    setGesture({ draft: { ...draft, hover: point }, readout: "直线" });
+  } else if (draft.type === "spline") {
+    setGesture({ draft: { ...draft, hover: point }, readout: `样条 ${draft.points.length} 点` });
   } else {
     setGesture({ draft: { ...draft, hover: point }, readout: `圆弧 ${draft.points.length}/3` });
   }
@@ -503,6 +569,24 @@ export function drawingClick(point: Vec2, closeToFirst: boolean): void {
     setGesture({ draft: { type: "polyline", points: [...points, point], hover: null }, readout: `多段线 ${points.length + 1} 点` });
     return;
   }
+  if (state.tool === "line") {
+    const draft = getGesture().draft;
+    const points = draft?.type === "line" ? draft.points : [];
+    const next = [...points, point];
+    if (next.length >= 2) {
+      setGesture({ draft: null, readout: "" });
+      addEntity(sketchId, { id: uid("en"), type: "line", a: next[0], b: next[1] });
+      return;
+    }
+    setGesture({ draft: { type: "line", points: next, hover: null }, readout: "直线，再点终点" });
+    return;
+  }
+  if (state.tool === "spline") {
+    const draft = getGesture().draft;
+    const points = draft?.type === "spline" ? draft.points : [];
+    setGesture({ draft: { type: "spline", points: [...points, point], hover: null }, readout: `样条 ${points.length + 1} 点，回车结束` });
+    return;
+  }
   if (state.tool !== "arc") return;
   const draft = getGesture().draft;
   const points = draft?.type === "arc" ? draft.points : [];
@@ -521,6 +605,14 @@ export function closePolyline(): void {
   if (!sketchId || draft?.type !== "polyline" || draft.points.length < 3) return;
   setGesture({ draft: null, readout: "" });
   addEntity(sketchId, { id: uid("en"), type: "polyline", points: draft.points, closed: true });
+}
+
+export function finishSpline(): void {
+  const sketchId = state.activeSketchId;
+  const draft = getGesture().draft;
+  if (!sketchId || draft?.type !== "spline" || draft.points.length < 3) return;
+  setGesture({ draft: null, readout: "" });
+  addEntity(sketchId, { id: uid("en"), type: "spline", points: draft.points });
 }
 
 export function cancelDraft(): void {
@@ -726,6 +818,246 @@ export function importStepText(text: string, fileName: string): void {
   }, { selection: { kind: "body", id: bodyId }, tool: "select", status: "已导入 STEP。它会作为一条特征参与重放。" });
 }
 
+export function beginSweep(): void {
+  const profile = resolveProfile();
+  if (!profile) {
+    update({ tool: "sweep", pendingSweep: null, pendingLoft: [], status: "先选择一个封闭截面，再扫掠。" });
+    return;
+  }
+  update({
+    tool: "sweep",
+    pendingSweep: profile,
+    pendingLoft: [],
+    activeSketchId: null,
+    extrudeDraft: null,
+    revolveDraft: null,
+    pendingBoolean: null,
+    edgePick: false,
+    status: "再点一条路径。直线、样条、多段线或圆弧都可以。",
+  });
+}
+
+function confirmSweep(
+  profile: { sketchId: string; entityId: string },
+  path: { sketchId: string; entityId: string },
+): void {
+  const pathSketch = state.doc.sketches.find((item) => item.id === path.sketchId);
+  const pathEntity = pathSketch?.entities.find((item) => item.id === path.entityId);
+  if (!pathEntity) {
+    update({ status: "这条路径不存在。" });
+    return;
+  }
+  const featureId = uid("ft");
+  const bodyId = uid("bd");
+  commitDoc((document) => {
+    document.features.push({
+      id: featureId,
+      type: "sweep",
+      name: featureName(document, "sweep", "扫掠"),
+      profileSketchId: profile.sketchId,
+      profileEntityId: profile.entityId,
+      pathSketchId: path.sketchId,
+      pathEntityId: path.entityId,
+      bodyId,
+    });
+    pushBody(document, bodyId, featureId);
+  }, {
+    pendingSweep: null,
+    tool: "select",
+    selection: { kind: "body", id: bodyId },
+    status: "已沿路径扫掠。截面和路径可以在属性里更换。",
+  });
+}
+
+export function beginLoft(): void {
+  const profile = resolveProfile();
+  update({
+    tool: "loft",
+    pendingSweep: null,
+    pendingLoft: profile ? [profile] : [],
+    activeSketchId: null,
+    extrudeDraft: null,
+    revolveDraft: null,
+    pendingBoolean: null,
+    edgePick: false,
+    status: profile ? "再点下一个封闭截面。至少两个后按回车。" : "依次点选封闭截面，至少两个，然后按回车。",
+  });
+}
+
+export function addLoftProfile(profile: { sketchId: string; entityId: string }): void {
+  const sketch = state.doc.sketches.find((item) => item.id === profile.sketchId);
+  const entity = sketch?.entities.find((item) => item.id === profile.entityId);
+  if (!entity || !isClosed(entity)) {
+    update({ status: "放样截面需要封闭。" });
+    return;
+  }
+  if (state.pendingLoft.some((item) => item.sketchId === profile.sketchId && item.entityId === profile.entityId)) {
+    update({ status: "这个截面已经在列表里。" });
+    return;
+  }
+  const pendingLoft = [...state.pendingLoft, profile];
+  update({
+    tool: "loft",
+    pendingLoft,
+    status: pendingLoft.length >= 2 ? `已选 ${pendingLoft.length} 个截面。按回车生成。` : "再点一个封闭截面。",
+  });
+}
+
+export function confirmLoft(): void {
+  if (state.pendingLoft.length < 2) {
+    update({ status: "放样至少需要两个封闭截面。" });
+    return;
+  }
+  const profiles = state.pendingLoft.map((item) => ({ sketchId: item.sketchId, entityId: item.entityId }));
+  const featureId = uid("ft");
+  const bodyId = uid("bd");
+  commitDoc((document) => {
+    document.features.push({
+      id: featureId,
+      type: "loft",
+      name: featureName(document, "loft", "放样"),
+      profiles,
+      ruled: true,
+      bodyId,
+    });
+    pushBody(document, bodyId, featureId);
+  }, {
+    pendingLoft: [],
+    tool: "select",
+    selection: { kind: "body", id: bodyId },
+    status: "已放样。截面顺序和直纹选项在属性里改。",
+  });
+}
+
+export function beginPush(): void {
+  update({
+    tool: "push",
+    pendingSweep: null,
+    pendingLoft: [],
+    edgePick: false,
+    extrudeDraft: null,
+    revolveDraft: null,
+    pendingBoolean: null,
+    status: "点一个面。正距离沿法向加料，负数减料。",
+  });
+}
+
+export async function pickFaceAt(bodyId: string, point: Vec3): Promise<void> {
+  try {
+    const face = await pickFace(collectModel(state), bodyId, point);
+    if (getState().tool === "push") {
+      createPush(bodyId, face);
+      return;
+    }
+    update({ selection: { kind: "face", bodyId, face }, status: "已选中面。用推拉面沿法向加料或减料。" });
+  } catch (error) {
+    update({ status: error instanceof Error ? error.message : "选面失败" });
+  }
+}
+
+function createPush(bodyId: string, face: FaceRef): void {
+  const featureId = uid("ft");
+  commitDoc((document) => {
+    document.features.push({
+      id: featureId,
+      type: "push",
+      name: featureName(document, "push", "推拉"),
+      bodyId,
+      face,
+      distance: 5,
+    });
+  }, { tool: "select", selection: { kind: "feature", id: featureId }, status: "已推拉该面。距离在属性里改，正数向外。" });
+}
+
+export function beginSplit(): void {
+  const bodyId = selectedBodyId();
+  if (!bodyId) {
+    update({ tool: "split", status: "先选中要切开的实体。" });
+    return;
+  }
+  const planeId = state.selection?.kind === "plane" ? state.selection.id : "plane-xy";
+  const featureId = uid("ft");
+  const newBodyId = uid("bd");
+  commitDoc((document) => {
+    document.features.push({
+      id: featureId,
+      type: "split",
+      name: featureName(document, "split", "分割"),
+      bodyId,
+      planeId,
+      keep: "both",
+      newBodyId,
+    });
+    pushBody(document, newBodyId, featureId);
+  }, { tool: "select", selection: { kind: "feature", id: featureId }, status: "已用平面切开。默认保留两侧，可在属性里只留一侧。" });
+}
+
+export function setSplitKeep(featureId: string, keep: "both" | "positive" | "negative"): void {
+  commitDoc((document) => {
+    const feature = document.features.find((item) => item.id === featureId);
+    if (!feature || feature.type !== "split") return;
+    if (keep === "both" && !feature.newBodyId) {
+      const bodyId = uid("bd");
+      feature.newBodyId = bodyId;
+      pushBody(document, bodyId, feature.id);
+    }
+    if (keep !== "both" && feature.newBodyId) {
+      const extraId = feature.newBodyId;
+      feature.newBodyId = null;
+      document.bodies = document.bodies.filter((body) => body.id !== extraId);
+    }
+    feature.keep = keep;
+  }, { status: keep === "both" ? "两侧都保留。" : "只保留一侧。" });
+}
+
+export function beginMeasure(): void {
+  update({
+    tool: "measure",
+    measureHits: [],
+    pendingSweep: null,
+    pendingLoft: [],
+    extrudeDraft: null,
+    revolveDraft: null,
+    pendingBoolean: null,
+    edgePick: false,
+    status: "点两个点或两条边。两条边还会给出夹角。测量不进特征历史。",
+  });
+}
+
+export function addMeasureHit(hit: MeasureHit): void {
+  const hits = state.measureHits.length >= 2 ? [hit] : [...state.measureHits, hit];
+  let status = "再点一个点或一条边。";
+  if (hits.length === 2) {
+    const distance = lengthOf(sub(hits[1].point, hits[0].point));
+    status = `距离 ${distance.toFixed(2)} mm`;
+    if (hits[0].direction && hits[1].direction) {
+      const cosine = Math.max(-1, Math.min(1, dot(normalize(hits[0].direction), normalize(hits[1].direction))));
+      const angle = (Math.acos(cosine) * 180) / Math.PI;
+      status += `，夹角 ${Math.min(angle, 180 - angle).toFixed(1)}°`;
+    }
+    status += "。测量不进入特征历史。";
+  }
+  update({ tool: "measure", measureHits: hits, status });
+}
+
+export function setPickFilter(pickFilter: PickFilter): void {
+  const label = pickFilter === "body" ? "实体" : pickFilter === "face" ? "面" : pickFilter === "edge" ? "边" : pickFilter === "sketch" ? "草图" : "全部";
+  update({ pickFilter, status: pickFilter === "all" ? "点选不再过滤。" : `只点选${label}。` });
+}
+
+export function setView(viewName: ViewName): void {
+  update({ viewName });
+}
+
+export function toggleSection(planeId?: string): void {
+  if (state.sectionPlaneId) {
+    update({ sectionPlaneId: null, status: "已关闭剖视。几何没有改动。" });
+    return;
+  }
+  const id = planeId ?? (state.selection?.kind === "plane" ? state.selection.id : "plane-xy");
+  update({ sectionPlaneId: id, status: "已按平面剖开显示。这只裁视口，不改实体。" });
+}
+
 export function beginEdgePick(): void {
   if (!selectedBodyId()) {
     update({ status: "先选中一个实体，再点选要倒圆的边。", edgePick: false });
@@ -819,10 +1151,7 @@ function removePlane(document: DocumentModel, planeId: string): void {
   document.planes = document.planes.filter((plane) => !drop.has(plane.id));
   document.sketches = document.sketches.filter((sketch) => !drop.has(sketch.planeId));
   if (entityIds.size > 0) {
-    removeFeatures(document, (feature) => {
-      const profile = profileOf(feature);
-      return profile != null && entityIds.has(profile.entityId);
-    });
+    removeFeatures(document, (feature) => referencedEntityIds(feature).some((id) => entityIds.has(id)));
   }
 }
 
@@ -875,14 +1204,15 @@ export function deleteSelection(): void {
     deleteFeature(selection.id);
     return;
   }
+  if (selection.kind === "face") {
+    update({ selection: null, status: "已取消面选择。" });
+    return;
+  }
   if (selection.kind === "entity") {
     commitDoc((document) => {
       const sketch = document.sketches.find((item) => item.id === selection.sketchId);
       if (sketch) sketch.entities = sketch.entities.filter((item) => item.id !== selection.entityId);
-      removeFeatures(document, (feature) => {
-        const profile = profileOf(feature);
-        return profile != null && profile.entityId === selection.entityId;
-      });
+      removeFeatures(document, (feature) => referencedEntityIds(feature).includes(selection.entityId));
     }, { selection: null, extrudeDraft: null, revolveDraft: null, pendingBoolean: null, status: "已删除截面。" });
     return;
   }
@@ -890,10 +1220,7 @@ export function deleteSelection(): void {
     const sketch = document.sketches.find((item) => item.id === selection.id);
     const entityIds = new Set(sketch?.entities.map((entity) => entity.id) ?? []);
     document.sketches = document.sketches.filter((item) => item.id !== selection.id);
-    removeFeatures(document, (feature) => {
-      const profile = profileOf(feature);
-      return profile != null && entityIds.has(profile.entityId);
-    });
+    removeFeatures(document, (feature) => referencedEntityIds(feature).some((id) => entityIds.has(id)));
   }, { selection: null, activeSketchId: state.activeSketchId === selection.id ? null : state.activeSketchId, extrudeDraft: null, revolveDraft: null, pendingBoolean: null, status: "已删除草图。" });
 }
 
@@ -1183,9 +1510,11 @@ function featureName(document: DocumentModel, type: Feature["type"], label: stri
   return `${label} ${count}`;
 }
 
-function profileOf(feature: Feature): { entityId: string } | null {
-  if (feature.type === "extrude" || feature.type === "revolve") return feature;
-  return null;
+function referencedEntityIds(feature: Feature): string[] {
+  if (feature.type === "extrude" || feature.type === "revolve") return [feature.entityId];
+  if (feature.type === "sweep") return [feature.profileEntityId, feature.pathEntityId];
+  if (feature.type === "loft") return feature.profiles.map((profile) => profile.entityId);
+  return [];
 }
 
 function referencedBodyIds(feature: Feature): string[] {
@@ -1203,7 +1532,13 @@ function referencedBodyIds(feature: Feature): string[] {
     case "circularPattern":
       return [feature.bodyId];
     case "step":
+    case "sweep":
+    case "loft":
       return [feature.bodyId];
+    case "push":
+      return [feature.bodyId];
+    case "split":
+      return feature.newBodyId ? [feature.bodyId, feature.newBodyId] : [feature.bodyId];
     case "move":
       return feature.newBodyId ? [feature.bodyId, feature.newBodyId] : [feature.bodyId];
     case "mirror":

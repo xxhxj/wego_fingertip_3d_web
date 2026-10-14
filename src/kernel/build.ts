@@ -118,6 +118,75 @@ export function makeRevolvedShape(
   return solid;
 }
 
+export function makeSweepShape(
+  kernel: OcctKernel,
+  profilePlane: PlaneFrame,
+  profile: SketchEntity,
+  pathPlane: PlaneFrame,
+  path: SketchEntity,
+  created: ShapeHandle[],
+): ShapeHandle {
+  if (!isClosed(profile)) throw new Error("截面未封闭");
+  const frame = frameOf(profilePlane);
+  const profileFace = makeProfileFace(kernel, frame, profile, created);
+  const profileWire = makeProfileWire(kernel, frame, profile, created);
+  const spine = makePathWire(kernel, frameOf(pathPlane), path, created);
+  const attempts: ShapeHandle[] = [];
+  const trySweep = (run: () => ShapeHandle) => {
+    try {
+      const shape = run();
+      created.push(shape);
+      attempts.push(shape);
+    } catch {
+      // 下一种扫掠方式继续试。
+    }
+  };
+  trySweep(() => kernel.pipe(profileFace, spine));
+  trySweep(() => kernel.pipe(profileWire, spine));
+  trySweep(() => kernel.sweep(profileWire, spine));
+  for (const shape of attempts) {
+    if (solidCount(kernel, shape) > 0) return shape;
+    try {
+      const solid = kernel.makeSolid(shape);
+      created.push(solid);
+      if (solidCount(kernel, solid) > 0) return solid;
+    } catch {
+      // 壳封不成实体时换下一种结果。
+    }
+  }
+  throw new Error("扫掠没有生成实体");
+}
+
+export function makeLoftShape(
+  kernel: OcctKernel,
+  profiles: { plane: PlaneFrame; entity: SketchEntity }[],
+  ruled: boolean,
+  created: ShapeHandle[],
+): ShapeHandle {
+  if (profiles.length < 2) throw new Error("放样至少需要两个截面");
+  const wires = profiles.map((profile) => {
+    if (!isClosed(profile.entity)) throw new Error("截面未封闭");
+    return makeProfileWire(kernel, frameOf(profile.plane), profile.entity, created);
+  });
+  const lofted = kernel.loft(wires, true, ruled);
+  created.push(lofted);
+  if (solidCount(kernel, lofted) === 0) throw new Error("放样没有生成实体");
+  return lofted;
+}
+
+function solidCount(kernel: OcctKernel, shape: ShapeHandle): number {
+  const solids = kernel.getSubShapes(shape, "solid");
+  const count = solids.length;
+  for (const solid of solids) {
+    try {
+      kernel.release(solid);
+    } catch {
+      // 句柄已经释放时忽略。
+    }
+  }
+  return count;
+}
+
 export interface MeshOptions {
   linearDeflection?: number;
   angularDeflection?: number;
@@ -323,6 +392,40 @@ function makeProfileFace(kernel: OcctKernel, plane: PlaneFrame, entity: SketchEn
   return face;
 }
 
+function makePathWire(kernel: OcctKernel, plane: PlaneFrame, entity: SketchEntity, created: ShapeHandle[]): ShapeHandle {
+  const edges = pathEdges(kernel, plane, entity, created);
+  if (edges.length === 0) throw new Error("路径太短");
+  const wire = kernel.makeWire(edges);
+  created.push(wire);
+  return wire;
+}
+
+function pathEdges(kernel: OcctKernel, plane: PlaneFrame, entity: SketchEntity, created: ShapeHandle[]): ShapeHandle[] {
+  if (entity.type === "line") {
+    const edge = kernel.makeLineEdge(toWorld(plane, entity.a), toWorld(plane, entity.b));
+    created.push(edge);
+    return [edge];
+  }
+  if (entity.type === "spline") {
+    if (entity.points.length < 2) throw new Error("样条至少需要两个点");
+    const edge = kernel.interpolatePoints(entity.points.map((point) => toWorld(plane, point)), false);
+    created.push(edge);
+    return [edge];
+  }
+  if (entity.type === "polyline" && !entity.closed) {
+    if (entity.points.length < 2) throw new Error("路径太短");
+    const world = entity.points.map((point) => toWorld(plane, point));
+    const edges: ShapeHandle[] = [];
+    for (let index = 0; index < world.length - 1; index += 1) {
+      const edge = kernel.makeLineEdge(world[index], world[index + 1]);
+      created.push(edge);
+      edges.push(edge);
+    }
+    return edges;
+  }
+  return profileEdges(kernel, plane, entity, created);
+}
+
 function profileEdges(kernel: OcctKernel, plane: PlaneFrame, entity: SketchEntity, created: ShapeHandle[]): ShapeHandle[] {
   if (entity.type === "rectangle") {
     return loopEdges(kernel, rectangleCorners(entity.a, entity.b).map((point) => toWorld(plane, point)), created);
@@ -335,6 +438,7 @@ function profileEdges(kernel: OcctKernel, plane: PlaneFrame, entity: SketchEntit
   if (entity.type === "polyline") {
     return loopEdges(kernel, entity.points.map((point) => toWorld(plane, point)), created);
   }
+  if (entity.type !== "arc") throw new Error("这条曲线不能当封闭截面");
   const start = toWorld(plane, entity.start);
   const mid = toWorld(plane, entity.mid);
   const end = toWorld(plane, entity.end);

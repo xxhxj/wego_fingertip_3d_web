@@ -164,6 +164,17 @@ try {
     return plane ? plane.origin.z : null;
   });
   if (Math.abs(offsetPlane - 12) > 1e-6) throw new Error(`偏置平面不对: ${offsetPlane}`);
+  await page.click("[data-view='top']");
+  const viewName = await page.evaluate(() => window.__wego.getState().viewName);
+  if (viewName !== "top") throw new Error(`视图方块没有切到顶视: ${viewName}`);
+  await page.click("[data-filter='sketch']");
+  const canvasBox = await page.$eval("canvas", (canvas) => {
+    const rect = canvas.getBoundingClientRect();
+    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+  });
+  await page.mouse.click(canvasBox.x, canvasBox.y);
+  const pickedBody = await page.evaluate(() => window.__wego.getState().selection?.kind === "body");
+  if (pickedBody) throw new Error("选择过滤没有挡住实体点选");
   const shot = join(await mkdtemp(join(tmpdir(), "wego-cad-")), "viewport.png");
   await page.screenshot({ path: shot });
   console.log(`screenshot ${shot}`);
