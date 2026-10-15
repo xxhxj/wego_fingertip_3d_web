@@ -41,6 +41,19 @@ export function exportStep(model: ReplayRequest, bodyId: string | null): Promise
   return request<string>("export-step", { model, bodyId }, (data) => String(data.step ?? ""));
 }
 
+export type ModelExportFormat = "step" | "stl" | "obj" | "glb" | "brep" | "svg" | "3mf";
+
+export function exportModel(
+  model: ReplayRequest,
+  bodyId: string | null,
+  format: ModelExportFormat,
+): Promise<{ text?: string; bytes?: ArrayBuffer }> {
+  return request("export-model", { model, bodyId, format }, (data) => ({
+    text: typeof data.text === "string" ? data.text : undefined,
+    bytes: data.bytes instanceof ArrayBuffer ? data.bytes : undefined,
+  }));
+}
+
 export function pickEdge(model: ReplayRequest, bodyId: string, point: Vec3): Promise<EdgeRef> {
   return request<EdgeRef>("pick-edge", { model, bodyId, point }, (data) => data.edge as EdgeRef);
 }

@@ -2,7 +2,7 @@ import wasmUrl from "occt-wasm/dist/occt-wasm.wasm?url";
 import { OcctKernel } from "occt-wasm";
 import type { BuildResult } from "./build";
 import type { ReplayRequest } from "./protocol";
-import { exportStepModel, pickEdgeOnBody, pickFaceOnBody, replayModel } from "./replay";
+import { exportFileModel, exportStepModel, pickEdgeOnBody, pickFaceOnBody, replayModel, type ModelExportFormat } from "./replay";
 import type { EdgeRef, FaceRef, Vec3 } from "../model/types";
 
 let kernelPromise: Promise<OcctKernel> | null = null;
@@ -20,6 +20,7 @@ self.onmessage = (event: MessageEvent<{
   model?: ReplayRequest;
   bodyId?: string | null;
   point?: Vec3;
+  format?: ModelExportFormat;
 }>) => {
   const message = event.data;
   if (message.type === "init") {
@@ -70,6 +71,25 @@ self.onmessage = (event: MessageEvent<{
       })
       .catch((error: unknown) => {
         post({ type: kind, id: requestId, error: error instanceof Error ? error.message : String(error) });
+      });
+    return;
+  }
+  if (message.type === "export-model" && message.id != null && message.model && message.format) {
+    const requestId = message.id;
+    const model = message.model;
+    const format = message.format;
+    loadKernel()
+      .then((kernel) => {
+        const file = exportFileModel(kernel, model, message.bodyId ?? null, format);
+        if (file.kind === "text") {
+          post({ type: "export-model", id: requestId, text: file.text });
+          return;
+        }
+        const bytes = file.bytes.buffer.slice(file.bytes.byteOffset, file.bytes.byteOffset + file.bytes.byteLength);
+        post({ type: "export-model", id: requestId, bytes }, [bytes]);
+      })
+      .catch((error: unknown) => {
+        post({ type: "export-model", id: requestId, error: error instanceof Error ? error.message : String(error) });
       });
   }
 };

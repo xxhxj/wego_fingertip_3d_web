@@ -46,7 +46,7 @@ try {
     if (message.type() === "error") logs.push(`console: ${message.text()}`);
   });
   await page.setViewport({ width: 1440, height: 900 });
-  await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle0", timeout: 60000 });
+  await page.goto(`http://127.0.0.1:${port}/?e2e=1`, { waitUntil: "networkidle0", timeout: 60000 });
   await page.waitForFunction(() => {
     const kernel = window.__wego?.getState().kernel;
     return kernel === "ready" || kernel === "error";
@@ -67,7 +67,9 @@ try {
   if (!booted.gpu || booted.viewportMessage) throw new Error(`WebGPU 不可用: ${booted.viewportMessage || "没有适配器"}`);
   if (booted.title !== "Wego CAD") throw new Error(`标题不对: ${booted.title}`);
 
+  await page.click("[data-dock='sketch']");
   await page.click("[data-tool='rectangle']");
+  await page.evaluate(() => window.__wego.startSketch("plane-xy"));
   await page.waitForFunction(() => window.__wego.getState().doc.sketches.length === 1);
 
   await page.evaluate(() => {
@@ -102,7 +104,10 @@ try {
     };
   });
   if (Math.abs(created.volume - 20000) / 20000 > 0.02) throw new Error(`体积不对: ${created.volume}`);
-  if (!created.visible || !created.tree) throw new Error("特征树没有显示新实体");
+  if (!created.visible) throw new Error("新实体不可见");
+  await page.click("[data-dock='history']");
+  const tree = await page.evaluate(() => document.body.innerText.includes("实体 1") && document.body.innerText.includes("拉伸 1"));
+  if (!tree) throw new Error("特征树没有显示新实体");
 
   await page.evaluate(() => {
     const feature = window.__wego.getState().doc.features[0];
@@ -167,6 +172,7 @@ try {
   await page.click("[data-view='top']");
   const viewName = await page.evaluate(() => window.__wego.getState().viewName);
   if (viewName !== "top") throw new Error(`视图方块没有切到顶视: ${viewName}`);
+  await page.click("[data-dock='tools']");
   await page.click("[data-filter='sketch']");
   const canvasBox = await page.$eval("canvas", (canvas) => {
     const rect = canvas.getBoundingClientRect();

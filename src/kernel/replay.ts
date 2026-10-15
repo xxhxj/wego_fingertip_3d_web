@@ -1,4 +1,5 @@
 import { BooleanOp, JoinType, type OcctKernel, type ShapeHandle } from "occt-wasm";
+import { meshesTo3mf, meshesToObj } from "../export/mesh";
 import { normalize } from "../model/math";
 import type { EdgeRef, FaceRef, Feature, PlaneFrame, SketchEntity, Vec3 } from "../model/types";
 import { makeExtrudedShape, makeLoftShape, makeRevolvedShape, makeSweepShape, measureVolume, tessellateShape, type BuildResult, type MeshOptions } from "./build";
@@ -16,7 +17,7 @@ export function replayModel(kernel: OcctKernel, request: ReplayRequest): BuildRe
     results.push(...built.errors);
     if (request.preview) {
       try {
-        const shape = previewShape(kernel, request, request.preview, created);
+        const shape = previewShape(kernel, request, request.preview, created, built.shapes);
         results.push(tessellateShape(kernel, "__preview__", shape, "preview"));
       } catch (error) {
         results.push({ id: "__preview__", error: messageOf(error) });
@@ -197,10 +198,16 @@ function previewShape(
   request: ReplayRequest,
   preview: ReplayPreview,
   created: ShapeHandle[],
+  shapes: Map<string, ShapeHandle>,
 ): ShapeHandle {
+  if (preview.kind === "push") {
+    const shape = shapes.get(preview.bodyId);
+    if (!shape) throw new Error("目标实体还没有生成");
+    return pushFace(kernel, shape, preview.face, preview.distance, created);
+  }
   const located = locate(request, preview.sketchId, preview.entityId);
   if (preview.kind === "extrude") {
-    return makeExtrudedShape(kernel, located.plane, located.entity, {
+    return makeExtrudedShape(kernel, located.plane, preview.entityOverride ?? located.entity, {
       start: preview.start,
       end: preview.end,
       wall: 0,
@@ -355,6 +362,78 @@ export function exportStepModel(kernel: OcctKernel, request: ReplayRequest, body
   } finally {
     releaseAll(kernel, created);
   }
+}
+
+export type ModelExportFormat = "step" | "stl" | "obj" | "glb" | "brep" | "svg" | "3mf";
+
+export type ModelExportFile =
+  | { kind: "text"; text: string }
+  | { kind: "binary"; bytes: Uint8Array };
+
+export function exportFileModel(
+  kernel: OcctKernel,
+  request: ReplayRequest,
+  bodyId: string | null,
+  format: ModelExportFormat,
+): ModelExportFile {
+  const created: ShapeHandle[] = [];
+  let document: { close: () => void } | null = null;
+  try {
+    const { shapes } = buildShapeMap(kernel, request, created);
+    const chosen = chosenShapes(request, shapes, bodyId);
+    const shape = chosen.length === 1 ? chosen[0].shape : kernel.makeCompound(chosen.map((item) => item.shape));
+    if (chosen.length > 1) created.push(shape);
+    if (format === "step") return { kind: "text", text: kernel.exportStep(shape) };
+    if (format === "brep") return { kind: "text", text: kernel.toBREP(shape) };
+    if (format === "svg") return { kind: "text", text: kernel.toMultiviewSVG(shape) };
+    if (format === "stl") return { kind: "binary", bytes: copyBytes(kernel.exportStl(shape, 0.15)) };
+    if (format === "obj" || format === "3mf") {
+      const parts = chosen.map((item) => ({ name: item.name, mesh: kernel.meshShape(item.shape, { linearDeflection: 0.15, angularDeflection: 0.4 }) }));
+      return format === "obj"
+        ? { kind: "text", text: meshesToObj(parts) }
+        : { kind: "binary", bytes: meshesTo3mf(parts) };
+    }
+    const xcaf = kernel.createXCAFDocument();
+    document = xcaf;
+    for (const item of chosen) {
+      xcaf.addShape(item.shape, { name: item.name, color: colorOf(item.color) });
+    }
+    return { kind: "binary", bytes: copyBytes(xcaf.exportGLTF({ linearDeflection: 0.15 })) };
+  } finally {
+    document?.close();
+    releaseAll(kernel, created);
+  }
+}
+
+function chosenShapes(
+  request: ReplayRequest,
+  shapes: Map<string, ShapeHandle>,
+  bodyId: string | null,
+): { shape: ShapeHandle; name: string; color: string }[] {
+  const ids = bodyId
+    ? [bodyId]
+    : request.bodies.filter((body) => body.visible).map((body) => body.id);
+  const chosen = ids.flatMap((id) => {
+    const shape = shapes.get(id);
+    if (!shape) return [];
+    const body = request.bodies.find((item) => item.id === id);
+    return [{ shape, name: body?.name || id, color: body?.color || "#b7c6d0" }];
+  });
+  if (chosen.length === 0) throw new Error("没有可导出的实体");
+  return chosen;
+}
+
+function colorOf(hex: string): [number, number, number] {
+  const match = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!match) return [0.72, 0.78, 0.82];
+  const value = Number.parseInt(match[1], 16);
+  return [((value >> 16) & 255) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255];
+}
+
+function copyBytes(data: Uint8Array): Uint8Array {
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(data);
+  return copy;
 }
 
 function pushFace(

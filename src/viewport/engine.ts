@@ -1,33 +1,42 @@
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { normalize, rayAxisScalar, rayPlane, snap2, toWorld, worldToPlane, yAxis } from "../model/math";
-import { centroidOf, sampleDraft, sampleEntity } from "../model/profiles";
+import { centroidOf, isClosed, sampleDraft, sampleEntity } from "../model/profiles";
 import type { PlaneFrame, Sample, SketchEntity, Vec2, Vec3 } from "../model/types";
 import {
-  beginTransient,
+  armFaceOffset,
+  armProfile,
+  cancelExtrude,
+  cancelFaceOffset,
+  confirmExtrude,
+  confirmFaceOffset,
   drawingClick,
   drawingDown,
   drawingMove,
   drawingUp,
-  endTransient,
   addMeasureHit,
   getState,
   pickFaceAt,
   select,
   setDraftDistances,
-  setFeatureDistances,
+  setFaceDistance,
   setViewportMessage,
   pickEdgeAt,
+  startSketch,
   subscribe,
 } from "../state/editor";
 import { getGesture, setGesture, subscribeGesture } from "../state/gesture";
 
 export type ViewName = "iso" | "top" | "bottom" | "front" | "back" | "left" | "right";
 
+export type DisplayMode = "shaded" | "wireframe";
+
 export interface ViewportApi {
   dispose: () => void;
   look: (view: ViewName) => void;
   alignToActiveSketch: () => void;
+  setDisplayMode: (mode: DisplayMode) => void;
+  capture: () => string;
 }
 
 const PLANE_SIZE = 180;
@@ -41,7 +50,9 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
   let disposed = false;
   let applyView: ((view: ViewName) => void) | null = null;
   let align: (() => void) | null = null;
+  let applyDisplay: ((mode: DisplayMode) => void) | null = null;
   let pendingView: ViewName | null = null;
+  let pendingDisplay: DisplayMode | null = null;
   const api: ViewportApi = {
     dispose() {
       disposed = true;
@@ -54,6 +65,11 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
     alignToActiveSketch() {
       align?.();
     },
+    setDisplayMode(mode) {
+      if (applyDisplay) applyDisplay(mode);
+      else pendingDisplay = mode;
+    },
+    capture: () => "",
   };
   current = api;
   void start();
@@ -77,20 +93,28 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
     }
 
     renderer.outputColorSpace = THREE.SRGBColorSpace;
+    (renderer as unknown as { localClippingEnabled: boolean }).localClippingEnabled = true;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    api.capture = () => {
+      try {
+        return renderer.domElement.toDataURL("image/png");
+      } catch {
+        return "";
+      }
+    };
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color("#1b1e24");
+    scene.background = new THREE.Color("#e6e7ea");
     const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 20000);
     camera.up.set(0, 0, 1);
     const controls = new OrbitControls(camera, canvas);
     controls.enableDamping = true;
     controls.dampingFactor = 0.12;
-    controls.screenSpacePanning = false;
+    controls.screenSpacePanning = true;
     controls.minDistance = 8;
     controls.maxDistance = 8000;
     controls.mouseButtons.LEFT = -1 as typeof THREE.MOUSE.ROTATE;
-    controls.mouseButtons.MIDDLE = THREE.MOUSE.ROTATE;
-    controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+    controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+    controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
     controls.target.set(0, 0, 0);
 
     scene.add(new THREE.HemisphereLight(0xf7f8fb, 0xb7c0ca, 1.35));
@@ -101,11 +125,11 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
     fill.position.set(-160, 120, 40);
     scene.add(fill);
 
-    const grid = new THREE.GridHelper(400, 40, 0x3a4452, 0x2a313b);
+    const grid = new THREE.GridHelper(500, 10, 0xb7bcc4, 0xd5d8de);
     grid.rotation.x = Math.PI / 2;
     grid.position.z = -0.2;
     scene.add(grid);
-    scene.add(new THREE.AxesHelper(48));
+    scene.add(new THREE.AxesHelper(72));
 
     const planeGroup = new THREE.Group();
     const bodyGroup = new THREE.Group();
@@ -117,7 +141,7 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
 
     const bodies = new Map<string, { mesh: THREE.Mesh; edges: THREE.LineSegments }>();
     const previewMaterial = new THREE.MeshStandardMaterial({
-      color: 0x2f6fed,
+      color: 0x14919b,
       transparent: true,
       opacity: 0.38,
       roughness: 0.35,
@@ -135,23 +159,82 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
     previewEdges.raycast = () => undefined;
     bodyGroup.add(previewMesh, previewEdges);
 
-    const handleMaterial = new THREE.MeshBasicMaterial({ color: 0x1f6feb, depthTest: false });
-    const startMaterial = new THREE.MeshBasicMaterial({ color: 0x0f9f6e, depthTest: false });
-    const endHandle = new THREE.Mesh(new THREE.SphereGeometry(1, 18, 12), handleMaterial);
-    const startHandle = new THREE.Mesh(new THREE.SphereGeometry(0.75, 16, 10), startMaterial);
-    const handleLine = new THREE.LineSegments(
+    const gizmo = new THREE.Group();
+    const dash = new THREE.Line(
       new THREE.BufferGeometry(),
-      new THREE.LineBasicMaterial({ color: 0x1f6feb, depthTest: false }),
+      new THREE.LineDashedMaterial({ color: 0x2c3138, dashSize: 2.4, gapSize: 1.6, depthTest: false }),
     );
-    endHandle.renderOrder = 3;
-    startHandle.renderOrder = 3;
-    handleLine.renderOrder = 2;
-    handleGroup.add(handleLine, startHandle, endHandle);
-    handleGroup.visible = false;
+    dash.frustumCulled = false;
+    const upCone = new THREE.Mesh(
+      new THREE.ConeGeometry(4.2, 11, 18),
+      new THREE.MeshBasicMaterial({ color: 0x2f6feb, depthTest: false }),
+    );
+    const downCone = new THREE.Mesh(
+      new THREE.ConeGeometry(3.4, 10, 18),
+      new THREE.MeshBasicMaterial({ color: 0x1c2430, depthTest: false }),
+    );
+    upCone.geometry.translate(0, 5.5, 0);
+    downCone.geometry.translate(0, 5, 0);
+    upCone.rotation.x = Math.PI / 2;
+    downCone.rotation.x = -Math.PI / 2;
+    upCone.renderOrder = 6;
+    downCone.renderOrder = 6;
+    dash.renderOrder = 5;
+    gizmo.add(dash, upCone, downCone);
+    gizmo.visible = false;
+    scene.add(gizmo);
+    const sketchGrid = planeGrid(160, 10);
+    sketchGrid.visible = false;
+    scene.add(sketchGrid);
+    const overlay = canvas.parentElement ?? document.body;
+    const readout = document.createElement("div");
+    readout.className = "pull-readout";
+    readout.hidden = true;
+    const totalTag = document.createElement("span");
+    totalTag.className = "dim-tag";
+    totalTag.textContent = "总计";
+    const distanceInput = document.createElement("input");
+    distanceInput.className = "pull-input";
+    distanceInput.inputMode = "decimal";
+    distanceInput.setAttribute("aria-label", "距离");
+    const unit = document.createElement("span");
+    unit.textContent = "毫米";
+    const field = document.createElement("label");
+    field.className = "pull-field";
+    field.append(distanceInput, unit);
+    readout.append(totalTag, field);
+    const widthLabel = chip("dim-label");
+    const heightLabel = chip("dim-label");
+    overlay.append(readout, widthLabel, heightLabel);
+    distanceInput.addEventListener("input", () => {
+      const value = Number(distanceInput.value);
+      if (!Number.isFinite(value)) return;
+      const pull = pullTarget();
+      if (!pull) return;
+      if (pull.kind === "extrude") {
+        const draft = getState().extrudeDraft;
+        if (!draft) return;
+        const sign = draft.end - draft.start < 0 ? -1 : 1;
+        setDraftDistances(draft.start, draft.start + sign * value);
+      } else setFaceDistance(value - pull.span);
+    });
+    distanceInput.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (getState().faceDraft) confirmFaceOffset();
+        else if (getState().extrudeDraft) confirmExtrude();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        if (getState().faceDraft) cancelFaceOffset();
+        else if (getState().extrudeDraft) cancelExtrude();
+      }
+    });
+    const profileMeshes: THREE.Mesh[] = [];
 
     const raycaster = new THREE.Raycaster();
     let appliedRevision = -1;
-    let drag: { which: "start" | "end"; pointerId: number } | null = null;
+    let drag: { kind: "extrude" | "face"; pointerId: number; grab: number } | null = null;
     let clickStart: { x: number; y: number } | null = null;
 
     const resize = () => {
@@ -198,6 +281,12 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
     shownView = pendingView ?? getState().viewName;
     pendingView = null;
     const clipPlane = new THREE.Plane();
+    let displayMode: DisplayMode = pendingDisplay ?? "shaded";
+    pendingDisplay = null;
+    applyDisplay = (mode) => {
+      displayMode = mode;
+      syncAppearance(getState());
+    };
 
     const sync = () => {
       const currentState = getState();
@@ -212,24 +301,54 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
       }
       syncAppearance(currentState);
       syncPlanes(currentState);
-      syncHandles(currentState);
+      syncHandles();
       syncSketch();
+      grid.visible = !currentState.activeSketchId;
+      const sketching = currentState.doc.sketches.find((item) => item.id === currentState.activeSketchId);
+      const sketchPlane = currentState.doc.planes.find((item) => item.id === sketching?.planeId);
+      sketchGrid.visible = Boolean(sketchPlane);
+      if (sketchPlane) orientPlane(sketchGrid, sketchPlane);
     };
     const unsub = subscribe(sync);
     const unsubGesture = subscribeGesture(syncSketch);
     sync();
 
+    const pivotOfView = () => {
+      const current = getState();
+      const sketch = current.doc.sketches.find((item) => item.id === current.activeSketchId);
+      const selectedPlane = current.selection?.kind === "plane" ? current.selection.id : null;
+      const planeId = sketch?.planeId ?? selectedPlane;
+      const plane = current.doc.planes.find((item) => item.id === planeId);
+      if (!plane) return new THREE.Vector3(0, 0, 0);
+      return new THREE.Vector3(plane.origin.x, plane.origin.y, plane.origin.z);
+    };
+    const onNavigateDown = (event: PointerEvent) => {
+      if (event.button !== 1 && event.button !== 2) return;
+      event.preventDefault();
+      if (event.button !== 2) return;
+      const pivot = pivotOfView();
+      const offset = camera.position.clone().sub(controls.target);
+      controls.target.copy(pivot);
+      camera.position.copy(pivot).add(offset);
+      controls.update();
+    };
+    canvas.addEventListener("pointerdown", onNavigateDown, true);
+
     const onPointerDown = (event: PointerEvent) => {
       if (event.button !== 0) return;
-      const target = extrudeTarget();
-      const which = target ? handleHit(event, target) : null;
-      if (which && target) {
-        drag = { which, pointerId: event.pointerId };
-        beginTransient();
+      const pull = pullTarget();
+      if (pull && pullHit(event, pull)) {
+        const scalar = axisDistance(event, pull.origin, pull.normal) ?? 0;
+        drag = { kind: pull.kind, pointerId: event.pointerId, grab: scalar - pull.distance };
         canvas.setPointerCapture(event.pointerId);
         return;
       }
       const tool = getState().tool;
+      if (isDrawTool(tool) && !getState().activeSketchId) {
+        const planeId = planeUnderPointer(event);
+        if (!planeId) return;
+        startSketch(planeId, tool);
+      }
       if (isDrawTool(tool) && getState().activeSketchId) {
         const point = sketchPoint(event);
         if (!point) return;
@@ -244,16 +363,15 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
     };
     const onPointerMove = (event: PointerEvent) => {
       if (drag) {
-        const target = extrudeTarget();
-        if (!target) return;
-        const distance = axisDistance(event, target);
+        const pull = pullTarget();
+        if (!pull) return;
+        const distance = axisDistance(event, pull.origin, pull.normal);
         if (distance == null) return;
-        const snapped = snapNumber(distance, event.altKey);
-        if (target.mode === "draft") {
-          setDraftDistances(drag.which === "start" ? snapped : target.start, drag.which === "end" ? snapped : target.end);
-        } else {
-          setFeatureDistances(target.featureId, drag.which === "start" ? snapped : target.start, drag.which === "end" ? snapped : target.end);
-        }
+        const snapped = snapNumber(distance - drag.grab, event.altKey);
+        if (drag.kind === "extrude") {
+          const draft = getState().extrudeDraft;
+          if (draft) setDraftDistances(draft.start, snapped);
+        } else setFaceDistance(snapped);
         return;
       }
       const tool = getState().tool;
@@ -263,8 +381,8 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
         if (tool === "rectangle" || tool === "circle") {
           if (getGesture().draft) drawingMove(point);
         } else {
-          const draft = getGesture().draft;
-          if (draft && (draft.type === "polyline" || draft.type === "arc" || draft.type === "line" || draft.type === "spline")) drawingMove(point);
+          const gestureDraft = getGesture().draft;
+          if (gestureDraft && (gestureDraft.type === "polyline" || gestureDraft.type === "arc" || gestureDraft.type === "line" || gestureDraft.type === "spline")) drawingMove(point);
           else setGesture({ readout: `u ${point.x.toFixed(1)}  v ${point.y.toFixed(1)}` });
         }
         return;
@@ -275,7 +393,6 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
       if (event.button !== 0) return;
       if (drag && drag.pointerId === event.pointerId) {
         drag = null;
-        endTransient();
         if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
         return;
       }
@@ -303,10 +420,9 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
 
     renderer.setAnimationLoop(() => {
       controls.update();
-      const distance = camera.position.distanceTo(endHandle.position);
-      const scale = Math.max(distance / 90, 0.8);
-      endHandle.scale.setScalar(scale);
-      startHandle.scale.setScalar(scale);
+      const scale = Math.max(camera.position.distanceTo(gizmo.position) / 220, 0.85);
+      upCone.scale.setScalar(scale);
+      downCone.scale.setScalar(scale);
       renderer.render(scene, camera);
     });
 
@@ -316,6 +432,7 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
       unsub();
       unsubGesture();
       observer.disconnect();
+      canvas.removeEventListener("pointerdown", onNavigateDown, true);
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerup", onPointerUp);
@@ -326,6 +443,12 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
       disposeGroup(bodyGroup);
       disposeGroup(sketchGroup);
       disposeGroup(handleGroup);
+      sketchGrid.geometry.dispose();
+      (sketchGrid.material as THREE.Material).dispose();
+      disposeGroup(gizmo);
+      readout.remove();
+      widthLabel.remove();
+      heightLabel.remove();
       renderer.dispose();
     };
 
@@ -383,7 +506,7 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
             new THREE.BufferGeometry(),
             new THREE.MeshStandardMaterial({ color: 0x2f6fed, roughness: 0.42, metalness: 0.06, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }),
           );
-          const edges = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xd5dee8 }));
+          const edges = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x5e6974 }));
           edges.raycast = () => undefined;
           mesh.userData = { kind: "body", id };
           bodyGroup.add(mesh, edges);
@@ -407,17 +530,21 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
     function syncAppearance(currentState: ReturnType<typeof getState>): void {
       const selectedBody = currentState.selection?.kind === "body" ? currentState.selection.id : null;
       const clips = clippingOf(currentState);
+      const wire = displayMode === "wireframe";
       previewMaterial.clippingPlanes = clips;
+      previewMaterial.wireframe = wire;
       (previewEdges.material as THREE.LineBasicMaterial).clippingPlanes = clips;
+      previewEdges.visible = Boolean(currentState.preview && currentState.preview.edges.length > 0 && !wire);
       for (const body of currentState.doc.bodies) {
         const visual = bodies.get(body.id);
         if (!visual) continue;
         visual.mesh.visible = body.visible;
-        visual.edges.visible = body.visible;
+        visual.edges.visible = body.visible && !wire;
         const material = visual.mesh.material as THREE.MeshStandardMaterial;
+        material.wireframe = wire;
         material.color.set(body.color);
         material.emissive.set(selectedBody === body.id ? body.color : "#000000");
-        material.emissiveIntensity = selectedBody === body.id ? 0.28 : 0;
+        material.emissiveIntensity = selectedBody === body.id ? 0.18 : 0;
         material.clippingPlanes = clips;
         (visual.edges.material as THREE.LineBasicMaterial).clippingPlanes = clips;
       }
@@ -439,48 +566,63 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
       return [clipPlane];
     }
 
-    function syncHandles(currentState: ReturnType<typeof getState>): void {
-      const target = extrudeTarget();
-      handleGroup.visible = Boolean(target);
-      if (!target) return;
-      const origin = toWorld(target.plane, centroidOf(target.entity));
-      const normal = normalize(target.plane.normal);
-      const start = {
-        x: origin.x + normal.x * target.start,
-        y: origin.y + normal.y * target.start,
-        z: origin.z + normal.z * target.start,
-      };
-      const end = {
-        x: origin.x + normal.x * target.end,
-        y: origin.y + normal.y * target.end,
-        z: origin.z + normal.z * target.end,
-      };
-      startHandle.position.set(start.x, start.y, start.z);
-      endHandle.position.set(end.x, end.y, end.z);
-      const positions = new Float32Array([start.x, start.y, start.z, end.x, end.y, end.z]);
-      handleLine.geometry.dispose();
+    function syncHandles(): void {
+      const pull = pullTarget();
+      gizmo.visible = Boolean(pull);
+      if (!pull) {
+        readout.hidden = true;
+        return;
+      }
+      const direction = normalize(pull.normal);
+      gizmo.position.set(pull.origin.x, pull.origin.y, pull.origin.z);
+      const zAxis = new THREE.Vector3(direction.x, direction.y, direction.z);
+      const helper = Math.abs(zAxis.z) > 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
+      const xAxis = new THREE.Vector3().crossVectors(helper, zAxis).normalize();
+      const yAxisVector = new THREE.Vector3().crossVectors(zAxis, xAxis).normalize();
+      gizmo.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(xAxis, yAxisVector, zAxis));
+      upCone.position.set(0, 0, pull.distance);
+      downCone.position.set(0, 0, pull.distance);
+      const tail = pull.kind === "extrude" ? 0 : -Math.max(pull.span, 0);
       const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-      handleLine.geometry = geometry;
-      handleMaterial.color.set(currentState.extrudeDraft ? 0x1f6feb : 0xd4880f);
+      geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array([0, 0, tail, 0, 0, pull.distance]), 3));
+      dash.geometry.dispose();
+      dash.geometry = geometry;
+      dash.computeLineDistances();
+      const total = pull.kind === "extrude"
+        ? Math.abs(pull.distance - (getState().extrudeDraft?.start ?? 0))
+        : pull.span + pull.distance;
+      if (document.activeElement !== distanceInput) distanceInput.value = formatMm(Math.max(total, 0));
+      placeElement(readout, {
+        x: pull.origin.x + direction.x * (pull.distance + 18),
+        y: pull.origin.y + direction.y * (pull.distance + 18),
+        z: pull.origin.z + direction.z * (pull.distance + 18),
+      });
     }
 
     function syncSketch(): void {
       clearGroup(sketchGroup);
+      profileMeshes.length = 0;
+      widthLabel.hidden = true;
+      heightLabel.hidden = true;
       const currentState = getState();
       const drawing = Boolean(currentState.activeSketchId);
       for (const sketch of currentState.doc.sketches) {
         const plane = currentState.doc.planes.find((item) => item.id === sketch.planeId);
         if (!plane) continue;
         for (const entity of sketch.entities) {
+          const sample = sampleEntity(entity);
           const selected = currentState.selection?.kind === "entity" && currentState.selection.entityId === entity.id;
-          addSample(sampleEntity(entity), plane, selected ? 0xf0b45a : 0xd7dee8, drawing);
+          addSample(sample, plane, selected ? 0xf0b45a : 0x3d4c63, drawing);
+          if (isClosed(entity)) addFill(sample, plane, sketch.id, entity.id, selected);
         }
       }
       const draft = getGesture().draft;
       const sketch = currentState.doc.sketches.find((item) => item.id === currentState.activeSketchId);
       const plane = currentState.doc.planes.find((item) => item.id === sketch?.planeId);
-      if (draft && plane) addSample(sampleDraft(draft), plane, 0x8eb6ff, true);
+      if (draft && plane) {
+        addSample(sampleDraft(draft), plane, 0x2f6feb, true);
+        if (draft.type === "rectangle") labelRectangle(plane, draft.a, draft.b);
+      }
     }
 
     function addSample(sample: Sample, plane: PlaneFrame, color: number, overlay: boolean): void {
@@ -580,8 +722,22 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
         else select(null, pointer);
         return;
       }
-      if (hits[0]?.object.userData.kind === "body") {
-        select({ kind: "body", id: String(hits[0].object.userData.id) }, pointer);
+      if (current.extrudeDraft) return;
+      const profileHits = raycaster.intersectObjects(profileMeshes, false);
+      const profile = profileHits[0];
+      const bodyHit = hits[0];
+      const direct = current.tool === "select" && current.pickFilter === "all" && !current.pendingBoolean && !current.pendingSweep && current.pendingLoft.length === 0 && !current.edgePick;
+      const profileFirst = Boolean(profile && (!bodyHit || profile.distance + 0.5 < bodyHit.distance));
+      if (direct && profileFirst && profile?.object.userData.kind === "profile") {
+        armProfile(String(profile.object.userData.sketchId), String(profile.object.userData.entityId));
+        return;
+      }
+      if (direct && bodyHit?.object.userData.kind === "body") {
+        void armFaceOffset(String(bodyHit.object.userData.id), { x: bodyHit.point.x, y: bodyHit.point.y, z: bodyHit.point.z });
+        return;
+      }
+      if (bodyHit?.object.userData.kind === "body") {
+        select({ kind: "body", id: String(bodyHit.object.userData.id) }, pointer);
         return;
       }
       selectPlane(pointer, false);
@@ -652,32 +808,41 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
       }
     }
 
-    function extrudeTarget(): {
-      mode: "draft" | "feature";
-      featureId: string;
-      plane: PlaneFrame;
-      entity: SketchEntity;
-      start: number;
-      end: number;
-    } | null {
+    function pullTarget(): { kind: "extrude" | "face"; origin: Vec3; normal: Vec3; distance: number; span: number } | null {
       const currentState = getState();
       const draft = currentState.extrudeDraft;
       if (draft) {
         const located = locate(draft.sketchId, draft.entityId);
         if (!located) return null;
-        return { mode: "draft", featureId: "", ...located, start: draft.start, end: draft.end };
+        return {
+          kind: "extrude",
+          origin: toWorld(located.plane, centroidOf(located.entity)),
+          normal: normalize(located.plane.normal),
+          distance: draft.end,
+          span: Math.abs(draft.end - draft.start),
+        };
       }
-      const picked = currentState.selection;
-      const featureId = picked?.kind === "feature"
-        ? picked.id
-        : picked?.kind === "body"
-          ? currentState.doc.bodies.find((body) => body.id === picked.id)?.featureId
-          : undefined;
-      const feature = currentState.doc.features.find((item) => item.id === featureId);
-      if (!feature || feature.type !== "extrude") return null;
-      const located = locate(feature.sketchId, feature.entityId);
-      if (!located) return null;
-      return { mode: "feature", featureId: feature.id, ...located, start: feature.start, end: feature.end };
+      const face = currentState.faceDraft;
+      if (!face) return null;
+      return {
+        kind: "face",
+        origin: face.face.midpoint,
+        normal: normalize(face.face.normal),
+        distance: face.distance,
+        span: face.span,
+      };
+    }
+
+    function pullHit(event: PointerEvent, pull: NonNullable<ReturnType<typeof pullTarget>>): boolean {
+      const tip = project({
+        x: pull.origin.x + pull.normal.x * pull.distance,
+        y: pull.origin.y + pull.normal.y * pull.distance,
+        z: pull.origin.z + pull.normal.z * pull.distance,
+      });
+      const base = project(pull.origin);
+      if (tip && Math.hypot(tip.x - event.clientX, tip.y - event.clientY) <= 28) return true;
+      if (!tip || !base) return false;
+      return distanceToSegment(event.clientX, event.clientY, base, tip) <= 16;
     }
 
     function locate(sketchId: string, entityId: string): { plane: PlaneFrame; entity: SketchEntity } | null {
@@ -689,39 +854,82 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
       return { plane, entity };
     }
 
-    function handleHit(event: PointerEvent, target: NonNullable<ReturnType<typeof extrudeTarget>>): "start" | "end" | null {
-      const origin = toWorld(target.plane, centroidOf(target.entity));
-      const normal = normalize(target.plane.normal);
-      const start = project({
-        x: origin.x + normal.x * target.start,
-        y: origin.y + normal.y * target.start,
-        z: origin.z + normal.z * target.start,
-      });
-      const end = project({
-        x: origin.x + normal.x * target.end,
-        y: origin.y + normal.y * target.end,
-        z: origin.z + normal.z * target.end,
-      });
-      const endDist = end ? Math.hypot(end.x - event.clientX, end.y - event.clientY) : Infinity;
-      const startDist = start ? Math.hypot(start.x - event.clientX, start.y - event.clientY) : Infinity;
-      if (endDist <= 16 && endDist <= startDist) return "end";
-      if (startDist <= 16) return "start";
-      return null;
+    function axisDistance(event: PointerEvent, origin: Vec3, normal: Vec3): number | null {
+      aim(event);
+      return rayAxisScalar(
+        { x: raycaster.ray.origin.x, y: raycaster.ray.origin.y, z: raycaster.ray.origin.z },
+        { x: raycaster.ray.direction.x, y: raycaster.ray.direction.y, z: raycaster.ray.direction.z },
+        origin,
+        normalize(normal),
+      );
     }
 
-    function axisDistance(event: PointerEvent, target: NonNullable<ReturnType<typeof extrudeTarget>>): number | null {
+    function aim(event: PointerEvent): void {
       const rect = canvas.getBoundingClientRect();
       raycaster.setFromCamera(new THREE.Vector2(
         ((event.clientX - rect.left) / rect.width) * 2 - 1,
         -((event.clientY - rect.top) / rect.height) * 2 + 1,
       ), camera);
-      const origin = toWorld(target.plane, centroidOf(target.entity));
-      return rayAxisScalar(
-        { x: raycaster.ray.origin.x, y: raycaster.ray.origin.y, z: raycaster.ray.origin.z },
-        { x: raycaster.ray.direction.x, y: raycaster.ray.direction.y, z: raycaster.ray.direction.z },
-        origin,
-        normalize(target.plane.normal),
-      );
+    }
+
+    function planeUnderPointer(event: PointerEvent): string | null {
+      aim(event);
+      const hits = raycaster.intersectObjects([...planeMeshes.values()], false);
+      const id = hits[0]?.object.userData.id;
+      return typeof id === "string" ? id : null;
+    }
+
+    function addFill(sample: Sample, plane: PlaneFrame, sketchId: string, entityId: string, selected: boolean): void {
+      if (sample.points.length < 3) return;
+      const positions: number[] = [];
+      for (const point of sample.points) {
+        const world = toWorld(plane, point);
+        positions.push(world.x, world.y, world.z);
+      }
+      const indices: number[] = [];
+      for (let index = 1; index < sample.points.length - 1; index += 1) indices.push(0, index, index + 1);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setIndex(indices);
+      geometry.computeVertexNormals();
+      const material = new THREE.MeshBasicMaterial({
+        color: selected ? 0x8eb6ff : 0xb9c7dc,
+        transparent: true,
+        opacity: 0.55,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.userData = { kind: "profile", sketchId, entityId };
+      sketchGroup.add(mesh);
+      profileMeshes.push(mesh);
+    }
+
+    function labelRectangle(plane: PlaneFrame, a: Vec2, b: Vec2): void {
+      const x0 = Math.min(a.x, b.x);
+      const x1 = Math.max(a.x, b.x);
+      const y0 = Math.min(a.y, b.y);
+      const y1 = Math.max(a.y, b.y);
+      placeChip(widthLabel, toWorld(plane, { x: (x0 + x1) / 2, y: y0 }), `${formatMm(x1 - x0)}毫米`);
+      placeChip(heightLabel, toWorld(plane, { x: x0, y: (y0 + y1) / 2 }), `${formatMm(y1 - y0)}毫米`);
+    }
+
+    function placeChip(label: HTMLDivElement, point: Vec3, text: string): void {
+      if (!placeElement(label, point)) return;
+      label.textContent = text;
+    }
+
+    function placeElement(label: HTMLElement, point: Vec3): boolean {
+      const screen = project(point);
+      const parent = canvas.parentElement?.getBoundingClientRect();
+      if (!screen || !parent) {
+        label.hidden = true;
+        return false;
+      }
+      label.hidden = false;
+      label.style.left = `${screen.x - parent.left}px`;
+      label.style.top = `${screen.y - parent.top}px`;
+      return true;
     }
 
     function project(point: Vec3): { x: number; y: number } | null {
@@ -736,7 +944,7 @@ export function mountViewport(canvas: HTMLCanvasElement): ViewportApi {
   }
 }
 
-function orientPlane(mesh: THREE.Mesh, plane: PlaneFrame): void {
+function orientPlane(mesh: THREE.Object3D, plane: PlaneFrame): void {
   const x = new THREE.Vector3(plane.xDir.x, plane.xDir.y, plane.xDir.z).normalize();
   const z = new THREE.Vector3(plane.normal.x, plane.normal.y, plane.normal.z).normalize();
   const y = new THREE.Vector3().crossVectors(z, x).normalize();
@@ -790,6 +998,46 @@ function toSegments(flat: number[], closed: boolean): Float32Array<ArrayBuffer> 
 
 function prevent(event: Event): void {
   event.preventDefault();
+}
+
+function chip(className: string): HTMLDivElement {
+  const label = document.createElement("div");
+  label.className = className;
+  label.hidden = true;
+  return label;
+}
+
+function formatMm(value: number): string {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+function planeGrid(size: number, step: number): THREE.LineSegments {
+  const positions: number[] = [];
+  for (let coordinate = -size; coordinate <= size; coordinate += step) {
+    positions.push(-size, coordinate, 0.05, size, coordinate, 0.05);
+    positions.push(coordinate, -size, 0.05, coordinate, size, 0.05);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  const lines = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: 0xc5cad1 }));
+  lines.raycast = () => undefined;
+  return lines;
+}
+
+function projectFactor(x: number, y: number, start: { x: number; y: number }, end: { x: number; y: number }): number {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSq = dx * dx + dy * dy;
+  if (lengthSq < 1) return 0;
+  return ((x - start.x) * dx + (y - start.y) * dy) / lengthSq;
+}
+
+function distanceToSegment(x: number, y: number, start: { x: number; y: number }, end: { x: number; y: number }): number {
+  const factor = Math.max(0, Math.min(1, projectFactor(x, y, start, end)));
+  const px = start.x + (end.x - start.x) * factor;
+  const py = start.y + (end.y - start.y) * factor;
+  return Math.hypot(x - px, y - py);
 }
 
 function replaceGeometry(mesh: THREE.Mesh, positions: Float32Array, normals: Float32Array, indices: Uint32Array): void {

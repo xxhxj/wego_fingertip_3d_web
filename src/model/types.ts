@@ -337,6 +337,24 @@ export interface ExtrudeDraft {
   end: number;
 }
 
+export type FaceEdge = "start" | "end" | "minU" | "maxU" | "minV" | "maxV";
+
+export interface FaceDraft {
+  bodyId: string;
+  face: FaceRef;
+  /** 相对点中时的变化，单位 mm。正数向外。 */
+  distance: number;
+  /** 点中时这一维的长度，单位 mm。 */
+  span: number;
+  /** extrude 改拉伸高度，sketch 改矩形边，仍是同一个实体。 */
+  mode: "extrude" | "sketch" | "push";
+  featureId: string | null;
+  sketchId: string | null;
+  entityId: string | null;
+  edge: FaceEdge | null;
+  align: number;
+}
+
 export interface Sample {
   points: Vec2[];
   closed: boolean;

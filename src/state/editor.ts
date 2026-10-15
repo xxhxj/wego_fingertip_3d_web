@@ -1,15 +1,17 @@
-import { replay, initKernel, exportStep, pickEdge, pickFace } from "../kernel/client";
+import { replay, initKernel, exportModel, pickEdge, pickFace, type ModelExportFormat } from "../kernel/client";
+import { sketchesToDxf } from "../export/dxf";
 import { isBuiltMesh, type BuildResult } from "../kernel/build";
 import type { ReplayRequest } from "../kernel/protocol";
 import { BODY_COLORS, cloneDoc, createDocument, uid } from "../model/document";
+import { createDeskOrganizer } from "../model/organizer";
 import { resolveDocumentPlanes } from "../model/planes";
-import { dot, lengthOf, normalize, sub } from "../model/math";
-import { entityLabel, isClosed } from "../model/profiles";
+import { dot, lengthOf, normalize, sub, toWorld, yAxis } from "../model/math";
+import { centroidOf, entityLabel, isClosed } from "../model/profiles";
 import type {
   DocumentModel,
   EdgeRef,
   ExtrudeDraft,
-  FaceRef,
+  FaceDraft,
   Feature,
   MeasureHit,
   PendingBoolean,
@@ -17,6 +19,7 @@ import type {
   RevolveDraft,
   Selection,
   SketchEntity,
+  FaceEdge,
   Tool,
   Vec2,
   Vec3,
@@ -44,6 +47,7 @@ export interface EditorState {
   selection: Selection | null;
   pointer: { x: number; y: number } | null;
   extrudeDraft: ExtrudeDraft | null;
+  faceDraft: FaceDraft | null;
   revolveDraft: RevolveDraft | null;
   pendingBoolean: PendingBoolean | null;
   pendingBisect: string | null;
@@ -64,6 +68,7 @@ export interface EditorState {
   volumes: Record<string, number>;
   meshRevision: number;
   licenseOpen: boolean;
+  projectName: string;
 }
 
 let state: EditorState = {
@@ -77,6 +82,7 @@ let state: EditorState = {
   selection: null,
   pointer: null,
   extrudeDraft: null,
+  faceDraft: null,
   revolveDraft: null,
   pendingBoolean: null,
   pendingBisect: null,
@@ -97,6 +103,7 @@ let state: EditorState = {
   volumes: {},
   meshRevision: 0,
   licenseOpen: false,
+  projectName: "未设置标题的项目",
 };
 
 const listeners = new Set<() => void>();
@@ -146,6 +153,60 @@ export function setLicenseOpen(open: boolean): void {
   update({ licenseOpen: open });
 }
 
+export function setProjectName(projectName: string): void {
+  const name = projectName.trim() || "未设置标题的项目";
+  update({ projectName: name, status: `项目名称已改为 ${name}。` });
+}
+
+function resetInteraction(status: string, extra: Partial<EditorState> = {}): Partial<EditorState> {
+  return {
+    tool: "select",
+    activeSketchId: null,
+    selection: null,
+    extrudeDraft: null,
+    faceDraft: null,
+    revolveDraft: null,
+    pendingBoolean: null,
+    pendingBisect: null,
+    pendingSweep: null,
+    pendingLoft: [],
+    edgePick: false,
+    measureHits: [],
+    pointer: null,
+    sectionPlaneId: null,
+    status,
+    ...extra,
+  };
+}
+
+export function newDocument(): void {
+  const blank = createDocument();
+  commitDoc((document) => {
+    document.planes = blank.planes;
+    document.sketches = [];
+    document.features = [];
+    document.bodies = [];
+  }, resetInteraction("已新建项目。选择一个基准面，然后开始草图。", {
+    projectName: "未设置标题的项目",
+  }));
+  setGesture({ draft: null, readout: "" });
+}
+
+export function loadDeskOrganizer(): void {
+  const sample = createDeskOrganizer();
+  commitDoc((document) => {
+    document.planes = sample.planes;
+    document.sketches = sample.sketches;
+    document.features = sample.features;
+    document.bodies = sample.bodies;
+  }, resetInteraction("桌面收纳盒已生成。可以从文件菜单导出 STEP。", {
+    projectName: "制作桌面收纳盒",
+    selection: { kind: "body", id: "body-tray" },
+    viewName: "iso",
+  }));
+  setGesture({ draft: null, readout: "" });
+}
+
 export function scheduleReplay(): void {
   if (state.kernel !== "ready") return;
   const mine = ticket + 1;
@@ -170,7 +231,7 @@ async function runReplay(mine: number): Promise<void> {
 
 function collectModel(current: EditorState): ReplayRequest {
   let preview: ReplayRequest["preview"] = null;
-  if (current.extrudeDraft) {
+  if (current.extrudeDraft && Math.abs(current.extrudeDraft.end - current.extrudeDraft.start) > 0.2) {
     preview = {
       kind: "extrude",
       sketchId: current.extrudeDraft.sketchId,
@@ -178,6 +239,8 @@ function collectModel(current: EditorState): ReplayRequest {
       start: current.extrudeDraft.start,
       end: current.extrudeDraft.end,
     };
+  } else if (current.faceDraft && Math.abs(current.faceDraft.distance) > 0.05) {
+    preview = facePreview(current);
   } else if (current.revolveDraft) {
     preview = {
       kind: "revolve",
@@ -286,11 +349,12 @@ function sanitize(current: EditorState): EditorState {
   }
   let pendingBoolean = current.pendingBoolean;
   if (pendingBoolean && !current.doc.bodies.some((body) => body.id === pendingBoolean?.targetBodyId)) pendingBoolean = null;
+  let faceDraft = current.faceDraft;
+  if (faceDraft && !current.doc.bodies.some((body) => body.id === faceDraft?.bodyId)) faceDraft = null;
   let tool = current.tool;
-  const drawing = tool === "rectangle" || tool === "circle" || tool === "polyline" || tool === "line" || tool === "spline" || tool === "arc";
-  if ((drawing && !activeSketchId) || (tool === "extrude" && !extrudeDraft) || (tool === "revolve" && !revolveDraft)) tool = "select";
+  if ((tool === "extrude" && !extrudeDraft) || (tool === "revolve" && !revolveDraft)) tool = "select";
   if ((tool === "fuse" || tool === "cut" || tool === "common") && !pendingBoolean) tool = "select";
-  return { ...current, activeSketchId, selection, extrudeDraft, revolveDraft, pendingBoolean, tool };
+  return { ...current, activeSketchId, selection, extrudeDraft, faceDraft, revolveDraft, pendingBoolean, tool };
 }
 
 function validSelection(document: DocumentModel, selection: Selection | null): Selection | null {
@@ -423,21 +487,24 @@ export function setTool(tool: Tool): void {
   }
   const drawing = tool === "rectangle" || tool === "circle" || tool === "polyline" || tool === "line" || tool === "spline" || tool === "arc";
   if (drawing && !state.activeSketchId) {
-    const selection = state.selection;
-    let planeId = "plane-xy";
-    if (selection?.kind === "plane") planeId = selection.id;
-    if (selection?.kind === "sketch") {
-      planeId = state.doc.sketches.find((sketch) => sketch.id === selection.id)?.planeId ?? planeId;
-    }
-    startSketch(planeId);
-    update({ tool });
+    const hadPreview = state.extrudeDraft != null || state.revolveDraft != null || state.faceDraft != null;
+    update({
+      tool,
+      extrudeDraft: null,
+      faceDraft: null,
+      revolveDraft: null,
+      pendingBoolean: null,
+      status: "在坐标面上按下并拖动，画出截面。Esc 退出草图。",
+    });
     setGesture({ draft: null, readout: "" });
+    if (hadPreview) scheduleReplay();
     return;
   }
-  const hadPreview = state.extrudeDraft != null || state.revolveDraft != null;
+  const hadPreview = state.extrudeDraft != null || state.revolveDraft != null || state.faceDraft != null;
   update({
     tool,
     extrudeDraft: null,
+    faceDraft: null,
     revolveDraft: null,
     pendingBoolean: null,
     pendingBisect: null,
@@ -450,21 +517,23 @@ export function setTool(tool: Tool): void {
   if (hadPreview) scheduleReplay();
 }
 
-export function startSketch(planeId: string): void {
+export function startSketch(planeId: string, keepTool?: Tool): void {
   const plane = state.doc.planes.find((item) => item.id === planeId);
   if (!plane) return;
+  const drawing = keepTool === "circle" || keepTool === "polyline" || keepTool === "line" || keepTool === "spline" || keepTool === "arc";
   const id = uid("sk");
   commitDoc((document) => {
     document.sketches.push({ id, name: `草图 ${document.sketches.length + 1}`, planeId, entities: [] });
   }, {
     activeSketchId: id,
-    tool: "rectangle",
+    tool: drawing ? keepTool : "rectangle",
     selection: { kind: "sketch", id },
     extrudeDraft: null,
+    faceDraft: null,
     revolveDraft: null,
     pendingBoolean: null,
     pointer: null,
-    status: `正在 ${plane.name} 上绘制。左键画图，中键旋转，右键平移。`,
+    status: `正在 ${plane.name} 上绘制。在这个面上拖出截面，Esc 退出。`,
   }, false);
   setGesture({ draft: null, readout: "" });
 }
@@ -496,7 +565,7 @@ export function finishSketch(): void {
     }, { activeSketchId: null, tool: "select", selection: null, status: "已退出空草图。" }, false);
     return;
   }
-  update({ activeSketchId: null, tool: "select", status: "草图已完成。选中封闭截面后可以拉伸。" });
+  update({ activeSketchId: null, tool: "select", faceDraft: null, status: "已退出草图。点击截面，拖动箭头生成实体。" });
 }
 
 function addEntity(sketchId: string, entity: SketchEntity): void {
@@ -642,21 +711,23 @@ function resolveProfile(sketchId?: string, entityId?: string): { sketchId: strin
   return null;
 }
 
-export function beginExtrude(sketchId?: string, entityId?: string): void {
+export function beginExtrude(sketchId?: string, entityId?: string, end = 20): void {
   const profile = resolveProfile(sketchId, entityId);
   if (!profile) {
     update({ status: "先画一个封闭截面，再拉伸。" });
     return;
   }
   setGesture({ draft: null, readout: "" });
+  const distance = Number.isFinite(end) ? end : 20;
   update({
     tool: "extrude",
     activeSketchId: null,
-    extrudeDraft: { sketchId: profile.sketchId, entityId: profile.entityId, start: 0, end: 20 },
+    extrudeDraft: { sketchId: profile.sketchId, entityId: profile.entityId, start: 0, end: distance },
+    faceDraft: null,
     revolveDraft: null,
     pendingBoolean: null,
     selection: { kind: "entity", sketchId: profile.sketchId, entityId: profile.entityId },
-    status: "拖动蓝色箭头，或输入起止距离。确认后生成实体。",
+    status: "拖动箭头预览高度，也可以直接改数字。按 Enter 生成这一个实体，Esc 取消。",
   });
   scheduleReplay();
 }
@@ -713,10 +784,184 @@ export function confirmExtrude(): void {
     pendingBoolean: null,
     tool: "select",
     activeSketchId: null,
+    faceDraft: null,
     selection: { kind: "body", id: bodyId },
     pointer: null,
-    status: "已生成实体。可以在右侧改起止距离，或继续画下一个草图。",
+    status: "已生成实体。点任意一个面，拖动箭头改长宽高。",
   });
+}
+
+export function setFaceDistance(distance: number): void {
+  const draft = state.faceDraft;
+  if (!draft || !Number.isFinite(distance)) return;
+  const inward = draft.span > 0 ? Math.max(-(draft.span - 0.2), distance) : distance;
+  update({ faceDraft: { ...draft, distance: clampDistance(inward) } });
+  scheduleReplay();
+}
+
+export function confirmFaceOffset(): void {
+  const draft = state.faceDraft;
+  if (!draft) return;
+  if (Math.abs(draft.distance) < 0.2) {
+    update({ faceDraft: null, preview: null, status: "尺寸没有变化。" });
+    scheduleReplay();
+    return;
+  }
+  if (draft.mode === "push") {
+    const featureId = uid("ft");
+    commitDoc((document) => {
+      document.features.push({
+        id: featureId,
+        type: "push",
+        name: featureName(document, "push", "偏移面"),
+        bodyId: draft.bodyId,
+        face: draft.face,
+        distance: draft.distance,
+      });
+    }, {
+      faceDraft: null,
+      tool: "select",
+      selection: { kind: "body", id: draft.bodyId },
+      status: "已调整该面。再点其他面可以继续改尺寸。",
+    });
+    return;
+  }
+  commitDoc((document) => {
+    if (draft.mode === "extrude") {
+      const feature = document.features.find((item) => item.id === draft.featureId);
+      if (!feature || feature.type !== "extrude") return;
+      if (draft.edge === "start") feature.start = clampDistance(feature.start + draft.distance * draft.align);
+      else feature.end = clampDistance(feature.end + draft.distance * draft.align);
+      return;
+    }
+    const sketch = document.sketches.find((item) => item.id === draft.sketchId);
+    const entity = sketch?.entities.find((item) => item.id === draft.entityId);
+    if (!entity || entity.type !== "rectangle" || !draft.edge) return;
+    const shifted = shiftRectangle(entity, draft.edge, draft.distance);
+    entity.a = shifted.a;
+    entity.b = shifted.b;
+  }, {
+    faceDraft: null,
+    tool: "select",
+    selection: { kind: "body", id: draft.bodyId },
+    status: "已改这个方向的尺寸。还是这一个实体，点其他面可以继续调整。",
+  });
+}
+
+export function cancelFaceOffset(): void {
+  if (!state.faceDraft) return;
+  update({ faceDraft: null, preview: null, tool: "select", status: "已取消偏移。" });
+  scheduleReplay();
+}
+
+export function armProfile(sketchId: string, entityId: string): void {
+  const feature = [...state.doc.features].reverse().find((item) => item.type === "extrude" && item.sketchId === sketchId && item.entityId === entityId);
+  if (!feature || feature.type !== "extrude") {
+    beginExtrude(sketchId, entityId, 0);
+    return;
+  }
+  const sketch = state.doc.sketches.find((item) => item.id === sketchId);
+  const entity = sketch?.entities.find((item) => item.id === entityId);
+  const plane = state.doc.planes.find((item) => item.id === sketch?.planeId);
+  if (!entity || !plane) return;
+  const origin = toWorld(plane, centroidOf(entity));
+  const normal = normalize(plane.normal);
+  void armFaceOffset(feature.bodyId, {
+    x: origin.x + normal.x * feature.end,
+    y: origin.y + normal.y * feature.end,
+    z: origin.z + normal.z * feature.end,
+  });
+}
+
+export async function armFaceOffset(bodyId: string, point: Vec3): Promise<void> {
+  try {
+    const face = await pickFace(collectModel(state), bodyId, point);
+    if (getState().extrudeDraft) return;
+    const found = state.doc.features.find((item) => item.type === "extrude" && item.bodyId === bodyId);
+    const feature = found && found.type === "extrude" ? found : undefined;
+    const sketch = feature ? state.doc.sketches.find((item) => item.id === feature.sketchId) : undefined;
+    const entityId = feature?.entityId;
+    const entity = sketch?.entities.find((item) => item.id === entityId);
+    const plane = sketch ? state.doc.planes.find((item) => item.id === sketch.planeId) : undefined;
+    const blank: FaceDraft = {
+      bodyId,
+      face,
+      distance: 0,
+      span: 0,
+      mode: "push",
+      featureId: feature?.id ?? null,
+      sketchId: feature?.sketchId ?? null,
+      entityId: feature?.entityId ?? null,
+      edge: null,
+      align: 1,
+    };
+    let draft = blank;
+    if (feature && feature.type === "extrude" && plane && entity) {
+      const normal = normalize(face.normal);
+      const align = dot(normal, normalize(plane.normal));
+      if (Math.abs(align) > 0.65) {
+        const along = dot(sub(face.midpoint, plane.origin), normalize(plane.normal));
+        const edge = Math.abs(along - feature.end) <= Math.abs(along - feature.start) ? "end" : "start";
+        draft = { ...blank, mode: "extrude", edge, align: align >= 0 ? 1 : -1, span: Math.abs(feature.end - feature.start) };
+      } else if (entity.type === "rectangle") {
+        const alongU = dot(normal, normalize(plane.xDir));
+        const alongV = dot(normal, yAxis(plane));
+        if (Math.abs(alongU) >= Math.abs(alongV)) {
+          draft = { ...blank, mode: "sketch", edge: alongU >= 0 ? "maxU" : "minU", span: Math.abs(entity.b.x - entity.a.x) };
+        } else {
+          draft = { ...blank, mode: "sketch", edge: alongV >= 0 ? "maxV" : "minV", span: Math.abs(entity.b.y - entity.a.y) };
+        }
+      }
+    }
+    update({
+      faceDraft: draft,
+      extrudeDraft: null,
+      selection: { kind: "body", id: bodyId },
+      tool: "select",
+      status: "箭头和数字是这一维的长度。拖动或改数字只预览，按 Enter 才生效，Esc 取消。",
+    });
+  } catch (error) {
+    update({ status: error instanceof Error ? error.message : "选面失败" });
+  }
+}
+
+function facePreview(current: EditorState): ReplayRequest["preview"] {
+  const draft = current.faceDraft;
+  if (!draft) return null;
+  if (draft.mode === "push") {
+    return { kind: "push", bodyId: draft.bodyId, face: draft.face, distance: draft.distance };
+  }
+  const feature = current.doc.features.find((item) => item.id === draft.featureId);
+  if (!feature || feature.type !== "extrude" || !draft.sketchId || !draft.entityId) return null;
+  let start = feature.start;
+  let end = feature.end;
+  let entityOverride: SketchEntity | undefined;
+  if (draft.mode === "extrude") {
+    if (draft.edge === "start") start = feature.start + draft.distance * draft.align;
+    else end = feature.end + draft.distance * draft.align;
+  } else if (draft.edge) {
+    const sketch = current.doc.sketches.find((item) => item.id === draft.sketchId);
+    const entity = sketch?.entities.find((item) => item.id === draft.entityId);
+    if (!entity || entity.type !== "rectangle") return null;
+    entityOverride = shiftRectangle(entity, draft.edge, draft.distance);
+  }
+  if (Math.abs(end - start) < 0.2) return null;
+  return { kind: "extrude", sketchId: draft.sketchId, entityId: draft.entityId, start, end, entityOverride };
+}
+
+function shiftRectangle(entity: Extract<SketchEntity, { type: "rectangle" }>, edge: FaceEdge, distance: number): Extract<SketchEntity, { type: "rectangle" }> {
+  const a = { ...entity.a };
+  const b = { ...entity.b };
+  const move = (key: "x" | "y", side: "min" | "max", delta: number) => {
+    const aIsSide = side === "max" ? a[key] >= b[key] : a[key] <= b[key];
+    if (aIsSide) a[key] += delta;
+    else b[key] += delta;
+  };
+  if (edge === "maxU") move("x", "max", distance);
+  else if (edge === "minU") move("x", "min", -distance);
+  else if (edge === "maxV") move("y", "max", distance);
+  else if (edge === "minV") move("y", "min", -distance);
+  return { ...entity, a, b };
 }
 
 export function cancelExtrude(): void {
@@ -783,24 +1028,57 @@ export function setBodyMesh(bodyId: string, patch: { deflection?: number; faceDe
   }, true);
 }
 
+const EXPORT_LABEL: Record<ModelExportFormat | "dxf", string> = {
+  step: "STEP",
+  stl: "STL",
+  obj: "OBJ",
+  glb: "GLB",
+  brep: "BREP",
+  svg: "SVG",
+  "3mf": "3MF",
+  dxf: "DXF",
+};
+
 export async function downloadStep(): Promise<void> {
-  if (state.kernel !== "ready") {
-    update({ status: "几何内核还没就绪。" });
-    return;
-  }
+  await downloadExport("step");
+}
+
+export async function downloadExport(format: ModelExportFormat | "dxf"): Promise<void> {
+  const safeName = state.projectName.replace(/[\\/:*?"<>|]/g, " ").trim() || "wego";
   try {
-    const step = await exportStep(collectModel(state), selectedBodyId());
-    const blob = new Blob([step], { type: "application/step" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "wego.step";
-    link.click();
-    URL.revokeObjectURL(url);
-    update({ status: "已导出 STEP。" });
+    if (format === "dxf") {
+      const text = sketchesToDxf(state.doc);
+      if (!text) {
+        update({ status: "还没有可导出的草图。" });
+        return;
+      }
+      saveDownload(new Blob([text], { type: "application/dxf" }), `${safeName}.dxf`);
+      update({ status: "已导出 DXF。坐标在各自草图平面上，单位 mm。" });
+      return;
+    }
+    if (state.kernel !== "ready") {
+      update({ status: "几何内核还没就绪。" });
+      return;
+    }
+    const file = await exportModel(collectModel(state), selectedBodyId(), format);
+    const blob = file.bytes
+      ? new Blob([file.bytes])
+      : new Blob([file.text ?? ""], { type: "text/plain" });
+    if (!file.bytes && !file.text) throw new Error("导出结果是空的");
+    saveDownload(blob, `${safeName}.${format}`);
+    update({ status: `已导出 ${EXPORT_LABEL[format]}。` });
   } catch (error) {
     update({ status: error instanceof Error ? error.message : "导出失败" });
   }
+}
+
+function saveDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 export function importStepText(text: string, fileName: string): void {
@@ -938,35 +1216,21 @@ export function beginPush(): void {
     extrudeDraft: null,
     revolveDraft: null,
     pendingBoolean: null,
-    status: "点一个面。正距离沿法向加料，负数减料。",
+    status: "点实体上的一个面，再拖动箭头。向外加料，向内减料。",
   });
 }
 
 export async function pickFaceAt(bodyId: string, point: Vec3): Promise<void> {
+  if (getState().tool === "push" || getState().pickFilter === "face") {
+    await armFaceOffset(bodyId, point);
+    return;
+  }
   try {
     const face = await pickFace(collectModel(state), bodyId, point);
-    if (getState().tool === "push") {
-      createPush(bodyId, face);
-      return;
-    }
-    update({ selection: { kind: "face", bodyId, face }, status: "已选中面。用推拉面沿法向加料或减料。" });
+    update({ selection: { kind: "face", bodyId, face }, faceDraft: null, status: "已选中面。可以再拖动箭头偏移。" });
   } catch (error) {
     update({ status: error instanceof Error ? error.message : "选面失败" });
   }
-}
-
-function createPush(bodyId: string, face: FaceRef): void {
-  const featureId = uid("ft");
-  commitDoc((document) => {
-    document.features.push({
-      id: featureId,
-      type: "push",
-      name: featureName(document, "push", "推拉"),
-      bodyId,
-      face,
-      distance: 5,
-    });
-  }, { tool: "select", selection: { kind: "feature", id: featureId }, status: "已推拉该面。距离在属性里改，正数向外。" });
 }
 
 export function beginSplit(): void {
